@@ -84,7 +84,7 @@ Trade-offs: a crash between writing `.bad` and shrinking the spool quarantines t
 Tests: `tests/test_spool.py` (truncated line, torn tail plus new append, garbage lines, storage down, clear).
 
 ## Extraction guards (page 2 review)
-- Order ids: a value with letters that does not start with ORD (TRK-…, INV-…) is not an order id, and neither are digits that sit inside an uppercase code in the text (`TRK-55123`, `INV 20931`), even if the model relabels them `ORD-…`. Product names match the catalogue on whole words only, so "Citizen watch" is not "Zen Air Purifier".
+- Order ids: an id is accepted only when "ORD" or "order" comes right before the 5 digits in the message (`ORD-48213`, `ord48213`, `order 48213`, `order no. 48213`), even if the model returns something else. So a pincode (`pincode 64101`), a tracking or invoice code (`TRK-55123`, `INV 20931`) or a bare `#48213` gives no order id. Trade-off: a customer who writes only "#48213" is missed, which is safer than inventing an order id for the wrong order. Product names match the catalogue on whole words only, so "Citizen watch" is not "Zen Air Purifier".
 
 ## Status meanings
 `queued` waiting · `processing` a worker holds it · `completed` · `failed` (3 attempts) · `rejected` (invalid input).

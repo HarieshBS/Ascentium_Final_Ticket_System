@@ -54,6 +54,17 @@ def test_order_id_written_differently_still_counts():
     assert clean(out(order_id="ORD-48213"), "my order ID 48213 and tracking TRK-99999")["order_id"] == "ORD-48213"
 
 
+@pytest.mark.parametrize("text", ["order 48213 is late", "order no. 48213", "ord48213", "ORD-48213"])
+def test_order_id_after_ord_or_order_is_kept(text):
+    assert clean(out(order_id="48213"), text)["order_id"] == "ORD-48213"
+
+
+@pytest.mark.parametrize("text", ["deliver to pincode 64101 please", "see #64101", "record 64101"])
+def test_bare_number_without_order_prefix_is_not_an_order_id(text):
+    assert clean(out(order_id="ORD-64101"), text)["order_id"] is None
+    assert clean(out(), text)["order_id"] is None
+
+
 @pytest.mark.parametrize("said,official", [("aura watch", "Aura Smart Watch"), ("Cloudsync", "CloudSync Pro"),
                                            ("Vista monitor", "Vista 4K Monitor"), ("phone case", "phone case"),
                                            ("Citizen watch", "Citizen watch")])

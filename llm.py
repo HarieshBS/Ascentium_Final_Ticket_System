@@ -152,27 +152,18 @@ def pick(v, allowed, name):
     raise BadOutput(f"invalid {name}: {str(v)[:40]!r}")
 
 
-ORD_IN_TEXT = re.compile(r"ord(?:er)?[\s#:\-_no.]*(\d{5})(?!\d)", re.I)
-
-
-CODE_BEFORE = re.compile(r"([A-Za-z]+)[-#]?\s?$")
-
-
-def foreign_code(text, i):
-    """True when the digits at text[i] belong to another code, e.g. TRK-55123 or INV 20931."""
-    m = CODE_BEFORE.search(text[max(0, i - 12):i])
-    return bool(m) and m[1].isupper() and not m[1].startswith("ORD") and m[1] not in ("ID", "NO")
+# "ORD-48213", "ord48213", "order 48213", "order no. 48213", "order ID is 48213"
+ORD_IN_TEXT = re.compile(r"\bord(?:er)?(?:[\s#:\-_.]|no|number|id|is)*(\d{5})(?!\d)", re.I)
 
 
 def order_id(v, text):
     if isinstance(v, str) and re.search(r"[a-z]", v, re.I) and not v.strip().lower().startswith("ord"):
         return None  # a tracking/invoice number the model passed off as an order id
     digits = "".join(re.findall(r"\d", v)) if isinstance(v, str) else ""
-    # The 5 digits must really be in the message (no hallucinated ids), and not as part of another code.
-    if len(digits) == 5 and any(not foreign_code(text, m.start())
-                                for m in re.finditer(rf"(?<!\d){digits}(?!\d)", text)):
-        return f"ORD-{digits}"
     found = set(ORD_IN_TEXT.findall(text))
+    # The digits must follow ORD/order in the message: no hallucinated ids, pincodes, TRK-/INV- codes.
+    if len(digits) == 5 and digits in found:
+        return f"ORD-{digits}"
     return f"ORD-{found.pop()}" if v is None and len(found) == 1 else None
 
 
