@@ -47,6 +47,7 @@ JSON keys:
   "High" ONLY if: the product or account is completely unusable (dead device, locked out, cannot log in at all), OR money was taken wrongly (charged twice, charged for something never ordered), OR a security concern (someone else in the account).
   "Medium" if something is wrong but they can still get by: a fault or defect they can work around, a wrong price or unexpected fee, an unexpected renewal, a pending or late refund, a late delivery, a verification code not arriving while they can still use the account.
   "Low": general questions, simple requests (e.g. an invoice copy), feedback, praise, feature ideas.
+  Refund requests are Medium (returns, cancellations, defective items being sent back, refunds that are late) unless money was taken wrongly as above.
   Angry tone, emojis, "URGENT" or "immediately" never raise urgency. When unsure between High and Medium, choose Medium.
 - "requested_action": short phrase for what the customer wants, or null if nothing is asked.
 Never guess: if a detail is not in the message, use null."""
