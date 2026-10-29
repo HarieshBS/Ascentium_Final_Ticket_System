@@ -37,14 +37,14 @@ If the LLM is unreachable, the worker pauses and no attempts are used. Design ch
 Prerequisites: Docker with Compose.
 
 ```bash
-cp .env.example .env        # then set LLM_BASE_URL and LLM_API_KEY
+cp -n .env.example .env     # -n: never overwrite an existing .env; then set LLM_BASE_URL
 docker compose up -d --build
 ```
 
 Windows PowerShell (one command per line):
 
 ```powershell
-Copy-Item .env.example .env          # first time only, then edit LLM_BASE_URL
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }   # never overwrites an existing .env
 docker compose up -d --build         # builds and starts db, ingest, worker, ops
 docker compose ps                    # all four should say (healthy) after ~20 s
 docker compose logs -f worker        # watch LLM processing; Ctrl+C to stop watching
