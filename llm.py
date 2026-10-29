@@ -155,10 +155,22 @@ def pick(v, allowed, name):
 ORD_IN_TEXT = re.compile(r"ord(?:er)?[\s#:\-_no.]*(\d{5})(?!\d)", re.I)
 
 
+CODE_BEFORE = re.compile(r"([A-Za-z]+)[-#]?\s?$")
+
+
+def foreign_code(text, i):
+    """True when the digits at text[i] belong to another code, e.g. TRK-55123 or INV 20931."""
+    m = CODE_BEFORE.search(text[max(0, i - 12):i])
+    return bool(m) and m[1].isupper() and not m[1].startswith("ORD") and m[1] not in ("ID", "NO")
+
+
 def order_id(v, text):
+    if isinstance(v, str) and re.search(r"[a-z]", v, re.I) and not v.strip().lower().startswith("ord"):
+        return None  # a tracking/invoice number the model passed off as an order id
     digits = "".join(re.findall(r"\d", v)) if isinstance(v, str) else ""
-    # The model may only return an id whose 5 digits really are in the message: no hallucinated ids.
-    if len(digits) == 5 and re.search(rf"(?<!\d){digits}(?!\d)", text):
+    # The 5 digits must really be in the message (no hallucinated ids), and not as part of another code.
+    if len(digits) == 5 and any(not foreign_code(text, m.start())
+                                for m in re.finditer(rf"(?<!\d){digits}(?!\d)", text)):
         return f"ORD-{digits}"
     found = set(ORD_IN_TEXT.findall(text))
     return f"ORD-{found.pop()}" if v is None and len(found) == 1 else None
@@ -169,7 +181,7 @@ def product(v):
         return None
     low = v.lower()
     for name in CATALOGUE:
-        if name.split()[0].lower() in low:  # first words are unique: Aura, Pulse, Nimbus, ...
+        if re.search(rf"\b{name.split()[0].lower()}\b", low):  # first words are unique: Aura, Pulse, Nimbus, ...
             return name
     match = difflib.get_close_matches(v, CATALOGUE, n=1, cutoff=0.6)
     return match[0] if match else v.strip()[:100]

@@ -42,8 +42,21 @@ def test_invoice_number_is_not_an_order_id():
     assert clean(out(order_id="INV-2024-001"), "Invoice INV-2024-001 is wrong")["order_id"] is None
 
 
+@pytest.mark.parametrize("model_said,text", [
+    ("TRK-55123", "Tracking TRK-55123 shows stuck"), ("INV-20931", "Invoice INV-20931 is wrong"),
+    ("ORD-55123", "Tracking TRK-55123 shows stuck"), ("ORD-20931", "please fix INV 20931"),
+])
+def test_tracking_and_invoice_numbers_are_not_order_ids(model_said, text):
+    assert clean(out(order_id=model_said), text)["order_id"] is None
+
+
+def test_order_id_written_differently_still_counts():
+    assert clean(out(order_id="ORD-48213"), "my order ID 48213 and tracking TRK-99999")["order_id"] == "ORD-48213"
+
+
 @pytest.mark.parametrize("said,official", [("aura watch", "Aura Smart Watch"), ("Cloudsync", "CloudSync Pro"),
-                                           ("Vista monitor", "Vista 4K Monitor"), ("phone case", "phone case")])
+                                           ("Vista monitor", "Vista 4K Monitor"), ("phone case", "phone case"),
+                                           ("Citizen watch", "Citizen watch")])
 def test_product_maps_to_catalogue(said, official):
     assert clean(out(product=said), "x")["product"] == official
 

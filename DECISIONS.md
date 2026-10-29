@@ -83,6 +83,9 @@ Trade-offs: a crash between writing `.bad` and shrinking the spool quarantines t
 `errors="replace"` means a torn multi-byte character is shown as `�` in the preview.
 Tests: `tests/test_spool.py` (truncated line, torn tail plus new append, garbage lines, storage down, clear).
 
+## Extraction guards (page 2 review)
+- Order ids: a value with letters that does not start with ORD (TRK-…, INV-…) is not an order id, and neither are digits that sit inside an uppercase code in the text (`TRK-55123`, `INV 20931`), even if the model relabels them `ORD-…`. Product names match the catalogue on whole words only, so "Citizen watch" is not "Zen Air Purifier".
+
 ## Status meanings
 `queued` waiting · `processing` a worker holds it · `completed` · `failed` (3 attempts) · `rejected` (invalid input).
 
