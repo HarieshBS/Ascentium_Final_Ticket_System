@@ -98,3 +98,19 @@ Tests: `tests/test_spool.py` (truncated line, torn tail plus new append, garbage
 The red "LLM service is DOWN" banner is gone from the ops screen. The health check behind it stays: the worker
 still pauses while the LLM is unreachable and puts the message back without using an attempt. The LLM tile in
 the health row still shows UP/DOWN as plain status, so ops can see why the queue is not moving without an alarm.
+
+## Afternoon change 2: LLM credibility and audit tracker
+Every LLM call writes one row to `llm_audit`: message_id, stage (classify/extract), model, prompt hash (sha256 of
+the fixed system prompt + few-shot, so a prompt edit is visible), raw output (first 4000 chars), latency, outcome,
+reason and the list of fields code had to change. No headers or keys are stored, only what the model returned.
+
+Outcomes: `passed` = every value used exactly as the model gave it; `corrected` = code changed a value (a made-up
+order id dropped, "medium" -> "Medium", "aura watch" -> "Aura Smart Watch"); `rejected` = unusable (no JSON, value
+outside the enum, timeout; costs an attempt); `unavailable` = endpoint down. Score = passed / (passed + corrected +
+rejected). Outages are left out because they say nothing about the model's answers.
+
+Trade-offs: a case-only fix counts as `corrected`. That is strict, but it measures how often code had to touch the
+answer. If storage is down the audit row goes to the spool like everything else (kind `audit`, replay is
+idempotent on a random id) and it does not hold the message back from the queue. `GET /api/llm-audit` returns
+the score, a per-stage breakdown, the fields corrected most often and the last 50 non-passed calls. The ops
+screen shows the same. Lives in `app.py`/`llm.py`, not a new service: it is one table and one query.

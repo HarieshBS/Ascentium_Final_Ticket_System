@@ -1,8 +1,10 @@
 """Prompt, LLM call and strict post-processing. No storage here, so it is easy to test."""
 import difflib
+import hashlib
 import json
 import os
 import re
+import time
 
 import httpx
 
@@ -87,15 +89,50 @@ def build_messages(system: str, keys: tuple, text: str) -> list:
     return msgs
 
 
+CLASSIFY_KEYS = ("category",)
+EXTRACT_KEYS = ("order_id", "product", "urgency", "requested_action")
+# Prompt version: hash of the fixed part of each prompt (system + few-shot), so a prompt edit shows up in the audit.
+PROMPT_HASH = {stage: hashlib.sha256(json.dumps(build_messages(s, k, "")).encode()).hexdigest()[:12]
+               for stage, s, k in (("classify", CLASSIFY_SYSTEM, CLASSIFY_KEYS), ("extract", EXTRACT_SYSTEM, EXTRACT_KEYS))}
+
+# Audit of the most recent call. ponytail: one worker, one call at a time, so a module global is enough.
+last: dict = {}
+
+
 # Two independent calls: neither prompt nor parser knows about the other's output.
 def classify(text: str) -> tuple[str, str]:
-    raw = _chat(build_messages(CLASSIFY_SYSTEM, ("category",), text))
-    return clean_category(raw), raw
+    d, raw = _audited("classify", CLASSIFY_SYSTEM, CLASSIFY_KEYS, text, lambda raw: {"category": clean_category(raw)})
+    return d["category"], raw
 
 
 def extract(text: str) -> tuple[dict, str]:
-    raw = _chat(build_messages(EXTRACT_SYSTEM, ("order_id", "product", "urgency", "requested_action"), text))
-    return clean_details(raw, text), raw
+    return _audited("extract", EXTRACT_SYSTEM, EXTRACT_KEYS, text, lambda raw: clean_details(raw, text))
+
+
+def _audited(stage, system, keys, text, clean):
+    """Call the model and record whether its answer was used as is, corrected by code, or rejected."""
+    last.clear()
+    last.update(stage=stage, model=MODEL, prompt_hash=PROMPT_HASH[stage], raw=None, latency_ms=None,
+                outcome="unavailable", reason=None, fields=[], at=time.time())
+    t = time.monotonic()
+    try:
+        raw = _chat(build_messages(system, keys, text))
+    except BadOutput as e:
+        last.update(outcome="rejected", reason=str(e))
+        raise
+    finally:
+        last["latency_ms"] = int((time.monotonic() - t) * 1000)
+    last["raw"] = raw[:4000]
+    try:
+        cleaned = clean(raw)
+    except BadOutput as e:
+        last.update(outcome="rejected", reason=str(e))
+        raise
+    said = parse(raw)
+    fixed = [k for k, v in cleaned.items() if said.get(k) != v]
+    last.update(outcome="corrected" if fixed else "passed", fields=fixed,
+                reason="; ".join(f"{k}: {said.get(k)!r} -> {cleaned[k]!r}" for k in fixed)[:500] or None)
+    return cleaned, raw
 
 
 def _chat(messages: list) -> str:

@@ -30,6 +30,12 @@
 <div class="row" id="health"></div>
 <div class="row" id="totals" aria-live="polite"></div>
 
+<h2>LLM credibility <span class="muted">(share of answers used exactly as the model gave them)</span></h2>
+<div class="row" id="audit" aria-live="polite"></div>
+<details><summary>Recent corrected or rejected LLM answers</summary>
+<div class="wrap"><table><thead><tr><th>ID</th><th>Stage</th><th>Outcome</th><th>Reason</th><th>Latency</th><th>Prompt</th><th>Raw output</th></tr></thead><tbody id="auditIssues"></tbody></table></div>
+</details>
+
 <h2>Failed messages <button id="retryAll">Retry all failed</button></h2>
 <div class="wrap"><table><thead><tr><th>ID</th><th>Attempts</th><th>Reason</th><th>Text</th><th></th></tr></thead><tbody id="failed"></tbody></table></div>
 
@@ -111,8 +117,27 @@ async function refresh() {
     return tr;
   }));
 }
-refresh();
+const pct = v => v == null ? "—" : Math.round(v * 100) + "%";
+async function refreshAudit() {
+  let a;
+  try { a = await (await fetch("/api/llm-audit")).json(); } catch { return; }
+  if (!a.score) return;
+  const st = a.by_stage || {};
+  document.getElementById("audit").replaceChildren(
+    tile("Overall", pct(a.score.passed_unmodified)), tile("Classify", pct(st.classify?.passed_unmodified)),
+    tile("Extract", pct(st.extract?.passed_unmodified)), tile("Passed", a.score.passed, "up"),
+    tile("Corrected by code", a.score.corrected), tile("Rejected", a.score.rejected, "down"),
+    ...a.corrected_fields.map(f => tile(f.field + " corrected", f.n)));
+  document.getElementById("auditIssues").replaceChildren(...a.recent_issues.map(r => {
+    const tr = el("tr");
+    tr.append(el("td", r.message_id), el("td", r.stage), el("td", r.outcome, r.outcome === "rejected" ? "s-failed" : "s-queued"),
+      el("td", r.reason ?? ""), el("td", r.latency_ms == null ? "" : r.latency_ms + " ms"), el("td", r.prompt_hash), el("td", r.raw_output ?? ""));
+    return tr;
+  }));
+}
+refresh(); refreshAudit();
 setInterval(refresh, 1000);
+setInterval(refreshAudit, 3000);
 </script>
 </body>
 </html>

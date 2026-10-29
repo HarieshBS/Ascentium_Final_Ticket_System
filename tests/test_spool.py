@@ -103,6 +103,7 @@ def test_category_survives_storage_outage_between_the_two_calls(tmp_path, monkey
     monkeypatch.setattr(app.llm, "extract", extract)
     monkeypatch.setattr(app, "save_classification", down)
     monkeypatch.setattr(app, "record_failure", down)
+    monkeypatch.setattr(app, "insert_audit", lambda a: None)
     app.worker()
 
     assert app.spooled_results == {"m1"}  # held back from the queue while only the spool has the category

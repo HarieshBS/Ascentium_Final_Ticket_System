@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -58,6 +59,20 @@ CREATE TABLE IF NOT EXISTS messages (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS messages_status ON messages (status, received_at);
+CREATE TABLE IF NOT EXISTS llm_audit (
+    id          TEXT PRIMARY KEY,
+    message_id  TEXT NOT NULL,
+    stage       TEXT NOT NULL,
+    model       TEXT,
+    prompt_hash TEXT,
+    raw_output  TEXT,
+    latency_ms  INT,
+    outcome     TEXT NOT NULL,   -- passed | corrected | rejected | unavailable
+    reason      TEXT,
+    fields      TEXT[] NOT NULL DEFAULT '{}',   -- fields code had to correct
+    created_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS llm_audit_created ON llm_audit (created_at);
 """
 
 
@@ -84,6 +99,9 @@ def ensure_schema():
 
 # ---------- spool: local, fsynced fallback when storage is down ----------
 
+HOLDS_BACK = ("class", "result")  # spooled LLM results: the message must not be re-processed until replayed
+
+
 def spool(record: dict):
     with spool_lock:
         SPOOL.parent.mkdir(parents=True, exist_ok=True)
@@ -95,7 +113,7 @@ def spool(record: dict):
             f.write((json.dumps(record) + "\n").encode())
             f.flush()
             os.fsync(f.fileno())
-        if record["kind"] != "msg":
+        if record["kind"] in HOLDS_BACK:
             spooled_results.add(record["message_id"])
 
 
@@ -112,12 +130,13 @@ def replay_spool():
                     rec = json.loads(line)
                     mid, kind = rec["message_id"], rec["kind"]
                     args = {"msg": lambda: (mid, rec["text"]), "class": lambda: (mid, rec["category"], rec["calls"]),
-                            "result": lambda: (mid, rec["fields"], rec["calls"])}[kind]()
+                            "result": lambda: (mid, rec["fields"], rec["calls"]), "audit": lambda: (rec["audit"],)}[kind]()
                 except (ValueError, TypeError, KeyError):
                     bad.append(line)  # quarantined below; must not block the lines after it
                     done += 1
                     continue
-                {"msg": store_message, "class": save_classification, "result": save_result}[kind](*args)
+                {"msg": store_message, "class": save_classification, "result": save_result,
+                 "audit": insert_audit}[kind](*args)
                 done += 1
         finally:
             if bad:
@@ -151,7 +170,7 @@ def load_spooled_results():
     for line in read_lines(SPOOL):
         try:
             rec = json.loads(line)
-            if rec["kind"] != "msg":
+            if rec["kind"] in HOLDS_BACK:
                 spooled_results.add(rec["message_id"])
         except (ValueError, TypeError, KeyError):
             pass  # torn line: replay_spool quarantines it
@@ -238,6 +257,31 @@ def record_failure(message_id, reason, attempts, calls):
             ("failed" if final else "queued", attempts, reason, calls, 2 ** attempts, message_id))
 
 
+def insert_audit(a: dict):
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO llm_audit (id, message_id, stage, model, prompt_hash, raw_output, latency_ms, outcome,
+                                      reason, fields, created_at)
+               VALUES (%(id)s, %(message_id)s, %(stage)s, %(model)s, %(prompt_hash)s, %(raw)s, %(latency_ms)s,
+                       %(outcome)s, %(reason)s, %(fields)s, to_timestamp(%(at)s))
+               ON CONFLICT (id) DO NOTHING""", a)  # replay may run twice
+
+
+def ask(fn, mid, text):
+    """One LLM call plus its audit record, whatever the outcome."""
+    llm.last.clear()
+    try:
+        return fn(text)
+    finally:
+        if llm.last:
+            a = {**llm.last, "id": uuid.uuid4().hex, "message_id": mid}
+            try:
+                insert_audit(a)
+            except psycopg.Error:
+                health["storage"] = False
+                spool({"kind": "audit", "message_id": mid, "audit": a})
+
+
 def release(message_id):
     with db() as conn:
         conn.execute("UPDATE messages SET status = 'queued', not_before = NULL WHERE message_id = %s AND status = 'processing'",
@@ -266,7 +310,7 @@ def worker():
         calls, stage = 0, "classify"  # calls = LLM calls made but not yet written to storage
         try:
             if category is None:  # a saved classification is never redone, even after a failed extraction
-                category, _ = llm.classify(text)
+                category, _ = ask(llm.classify, mid, text)
                 calls += 1
                 try:
                     save_classification(mid, category, calls)
@@ -277,7 +321,7 @@ def worker():
                     spool({"kind": "class", "message_id": mid, "category": category, "calls": calls})
                     calls = 0
             stage = "extract"
-            details, raw = llm.extract(text)
+            details, raw = ask(llm.extract, mid, text)
             calls += 1
         except llm.LLMUnavailable as e:
             log.warning("LLM unavailable (%s); pausing, %s goes back to queue without using an attempt", e, mid)
@@ -446,6 +490,36 @@ def results():
                    FROM messages ORDER BY message_id""").fetchall()
     except psycopg.Error:
         raise HTTPException(503, "storage unavailable")
+
+
+@app.get("/api/llm-audit")
+def llm_audit():
+    """Credibility score: share of judged calls whose output was used exactly as the model gave it."""
+    try:
+        with db() as conn:
+            counts = conn.execute(
+                """SELECT stage, outcome, count(*) AS n, round(avg(latency_ms))::int AS avg_latency_ms
+                   FROM llm_audit GROUP BY 1, 2 ORDER BY 1, 2""").fetchall()
+            fields = conn.execute(
+                """SELECT f AS field, count(*) AS n FROM llm_audit, unnest(fields) f
+                   GROUP BY 1 ORDER BY 2 DESC""").fetchall()
+            recent = conn.execute(
+                """SELECT message_id, stage, model, prompt_hash, outcome, reason, latency_ms,
+                          left(raw_output, 300) AS raw_output, created_at
+                   FROM llm_audit WHERE outcome <> 'passed' ORDER BY created_at DESC LIMIT 50""").fetchall()
+    except psycopg.Error:
+        raise HTTPException(503, "storage unavailable")
+    return JSONResponse(json.loads(json.dumps(
+        {"score": credibility(counts), "by_stage": {s: credibility([c for c in counts if c["stage"] == s])
+                                                    for s in {c["stage"] for c in counts}},
+         "counts": counts, "corrected_fields": fields, "recent_issues": recent}, default=str)))
+
+
+def credibility(counts) -> dict:
+    # 'unavailable' is an outage, not the model's answer, so it is not judged.
+    n = {o: sum(c["n"] for c in counts if c["outcome"] == o) for o in ("passed", "corrected", "rejected", "unavailable")}
+    judged = n["passed"] + n["corrected"] + n["rejected"]
+    return {**n, "judged": judged, "passed_unmodified": round(n["passed"] / judged, 3) if judged else None}
 
 
 @app.get("/")
