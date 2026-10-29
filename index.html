@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ticket Desk</title>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1c1c1c; --muted:#666; --card:#fff; --line:#ddd; --ok:#1a7f37; --bad:#c62828; --warn:#9a6700; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#eee; --muted:#aaa; --card:#222; --line:#333; --ok:#4cc26b; --bad:#ff6b6b; --warn:#e3b341; } }
+  body { margin:0; padding:16px; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  h1 { margin:0 0 12px; font-size:22px; }
+  .alert { padding:10px 12px; margin-bottom:8px; border-radius:6px; background:var(--bad); color:#fff; font-weight:600; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:8px 12px; min-width:110px; }
+  .tile b { display:block; font-size:22px; }
+  .tile span { color:var(--muted); font-size:12px; }
+  .up { color:var(--ok); } .down { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; background:var(--card); }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { position:sticky; top:0; background:var(--card); }
+  .wrap { overflow-x:auto; border:1px solid var(--line); border-radius:6px; margin-bottom:16px; }
+  .s-completed { color:var(--ok); } .s-failed, .s-rejected { color:var(--bad); } .s-processing, .s-queued { color:var(--warn); }
+  button { padding:4px 10px; cursor:pointer; }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<h1>Ticket Desk</h1>
+<div id="alerts" role="alert" aria-live="assertive"></div>
+<div class="row" id="health"></div>
+<div class="row" id="totals" aria-live="polite"></div>
+
+<h2>Failed messages <button id="retryAll">Retry all failed</button></h2>
+<div class="wrap"><table><thead><tr><th>ID</th><th>Attempts</th><th>Reason</th><th>Text</th><th></th></tr></thead><tbody id="failed"></tbody></table></div>
+
+<h2>All messages <span class="muted">(latest 500)</span></h2>
+<div class="wrap"><table><thead><tr><th>ID</th><th>Status</th><th>Category</th><th>Order</th><th>Product</th><th>Urgency</th><th>Action</th><th>Attempts</th><th>Dupes</th><th>Failure reason</th></tr></thead><tbody id="all"></tbody></table></div>
+
+<script>
+// Customer text is untrusted: everything goes through textContent, never innerHTML.
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
+const tile = (label, value, cls) => { const t = el("div", null, "tile"); t.append(el("b", String(value), cls), el("span", label)); return t; };
+
+function token() {
+  let t = sessionStorage.getItem("opsToken");
+  return t;
+}
+async function post(url) {
+  let r = await fetch(url, { method: "POST", headers: { "x-ops-token": token() || "" } });
+  if (r.status === 401) {
+    const t = prompt("Ops token:");
+    if (!t) return;
+    sessionStorage.setItem("opsToken", t);
+    r = await fetch(url, { method: "POST", headers: { "x-ops-token": t } });
+  }
+  if (!r.ok) alert("Retry failed: " + r.status);
+  refresh();
+}
+document.getElementById("retryAll").onclick = () => post("/api/retry-failed");
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch("/api/state")).json(); }
+  catch { document.getElementById("alerts").replaceChildren(el("div", "Service unreachable: the ticket service itself is down", "alert")); return; }
+
+  const alerts = [];
+  if (!s.health.llm) alerts.push(el("div", "LLM service is DOWN: processing is paused and will resume automatically", "alert"));
+  if (!s.health.storage) alerts.push(el("div", `Storage is DOWN: new messages are kept safely on disk (${s.spooled} waiting)` + (s.stale ? ", figures below may be stale" : ""), "alert"));
+  document.getElementById("alerts").replaceChildren(...alerts);
+
+  document.getElementById("health").replaceChildren(
+    tile("LLM service", s.health.llm ? "UP" : "DOWN", s.health.llm ? "up" : "down"),
+    tile("Storage", s.health.storage ? "UP" : "DOWN", s.health.storage ? "up" : "down"),
+    tile("Waiting on disk", s.spooled));
+
+  const t = s.totals || {};
+  document.getElementById("totals").replaceChildren(
+    tile("Received", t.received ?? "?"), tile("In progress", t.in_progress ?? "?"), tile("Completed", t.completed ?? "?"),
+    tile("Failed", t.failed ?? "?"), tile("Rejected", t.rejected ?? "?"), tile("Duplicates ignored", t.duplicates ?? "?"),
+    tile("LLM calls", t.llm_calls ?? "?"), tile("Repeat LLM calls", t.llm_repeats ?? "?"));
+
+  const msgs = s.messages || [];
+  document.getElementById("failed").replaceChildren(...msgs.filter(m => m.status === "failed").map(m => {
+    const tr = el("tr"), b = el("button", "Retry");
+    b.onclick = () => post("/api/retry/" + encodeURIComponent(m.message_id));
+    b.setAttribute("aria-label", "Retry " + m.message_id);
+    const td = el("td"); td.append(b);
+    tr.append(el("td", m.message_id), el("td", m.attempts), el("td", m.failure_reason), el("td", m.text), td);
+    return tr;
+  }));
+  document.getElementById("all").replaceChildren(...msgs.map(m => {
+    const tr = el("tr");
+    tr.append(el("td", m.message_id), el("td", m.status, "s-" + m.status), el("td", m.category ?? "—"), el("td", m.order_id ?? "—"),
+      el("td", m.product ?? "—"), el("td", m.urgency ?? "—"), el("td", m.requested_action ?? "—"), el("td", m.attempts),
+      el("td", m.duplicates), el("td", m.failure_reason ?? ""));
+    return tr;
+  }));
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

@@ -1,0 +1,369 @@
+"""Ticket service: HTTP ingest, worker threads, ops API. Postgres is the queue and the source of truth."""
+import hmac
+import json
+import logging
+import os
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import psycopg
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
+from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict
+from psycopg.rows import dict_row
+
+import llm
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://tickets:tickets@localhost:5432/tickets")
+SPOOL = Path(os.environ.get("SPOOL_DIR", "spool")) / "spool.jsonl"
+WORKERS = int(os.environ.get("WORKERS", "3"))
+MAX_ATTEMPTS = 3
+LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
+OPS_TOKEN = os.environ.get("OPS_TOKEN", "")
+MAX_BODY = 1_000_000
+MAX_ID_LEN = 128
+
+log = logging.getLogger("tickets")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+health = {"llm": False, "storage": False}
+spool_lock = threading.Lock()
+spooled_results: set[str] = set()  # ids whose LLM result is on disk waiting for storage: never re-call the LLM for them
+last_state: dict = {}
+stop = threading.Event()
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    message_id       TEXT PRIMARY KEY,
+    text             TEXT,
+    status           TEXT NOT NULL,
+    category         TEXT,
+    order_id         TEXT,
+    product          TEXT,
+    urgency          TEXT,
+    requested_action TEXT,
+    attempts         INT NOT NULL DEFAULT 0,
+    failure_reason   TEXT,
+    duplicates       INT NOT NULL DEFAULT 0,
+    llm_calls        INT NOT NULL DEFAULT 0,
+    llm_repeats      INT NOT NULL DEFAULT 0,
+    llm_raw          TEXT,
+    not_before       TIMESTAMPTZ,
+    received_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS messages_status ON messages (status, received_at);
+"""
+
+
+def db():
+    return psycopg.connect(DATABASE_URL, connect_timeout=3, autocommit=True, row_factory=dict_row)
+
+
+def ensure_schema():
+    try:
+        conn = db()
+    except psycopg.OperationalError as e:
+        if "does not exist" not in str(e):
+            raise
+        # New empty storage location: create the database itself so switching is config-only.
+        params = conninfo_to_dict(DATABASE_URL)
+        with psycopg.connect(**{**params, "dbname": "postgres"}, connect_timeout=3, autocommit=True) as c:
+            c.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(params["dbname"])))
+        conn = db()
+    with conn:
+        conn.execute(SCHEMA)
+        # ponytail: single instance assumed, so anything 'processing' at startup was orphaned by a crash.
+        conn.execute("UPDATE messages SET status = 'queued', not_before = NULL WHERE status = 'processing'")
+
+
+# ---------- spool: local, fsynced fallback when storage is down ----------
+
+def spool(record: dict):
+    with spool_lock:
+        SPOOL.parent.mkdir(parents=True, exist_ok=True)
+        with SPOOL.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if record["kind"] == "result":
+            spooled_results.add(record["message_id"])
+
+
+def replay_spool():
+    """Push spooled messages/results into storage. Safe to run twice: every write is idempotent."""
+    with spool_lock:
+        if not SPOOL.exists():
+            return
+        lines = SPOOL.read_text(encoding="utf-8").splitlines()
+        done = 0
+        try:
+            for line in lines:
+                rec = json.loads(line)
+                if rec["kind"] == "msg":
+                    store_message(rec["message_id"], rec["text"])
+                else:
+                    save_result(rec["message_id"], rec["fields"], rec["calls"], rec["repeat"])
+                    spooled_results.discard(rec["message_id"])
+                done += 1
+        finally:
+            rest = lines[done:]
+            tmp = SPOOL.with_suffix(".tmp")
+            tmp.write_text("".join(l + "\n" for l in rest), encoding="utf-8")
+            os.replace(tmp, SPOOL)
+    if done:
+        log.info("replayed %d spooled records", done)
+
+
+def spool_size() -> int:
+    with spool_lock:
+        return len(SPOOL.read_text(encoding="utf-8").splitlines()) if SPOOL.exists() else 0
+
+
+def load_spooled_results():
+    if SPOOL.exists():
+        for line in SPOOL.read_text(encoding="utf-8").splitlines():
+            rec = json.loads(line)
+            if rec["kind"] == "result":
+                spooled_results.add(rec["message_id"])
+
+
+# ---------- storage operations ----------
+
+def store_message(message_id: str, text) -> bool:
+    """Insert once; a repeat only bumps the duplicate counter. Returns True if new."""
+    if not isinstance(text, str):
+        status, reason = "rejected", "text is not a string"
+    elif not text.strip():
+        status, reason = "rejected", "empty message"
+    else:
+        status, reason = "queued", None
+    with db() as conn:
+        row = conn.execute(
+            """INSERT INTO messages (message_id, text, status, failure_reason) VALUES (%s, %s, %s, %s)
+               ON CONFLICT (message_id) DO UPDATE SET duplicates = messages.duplicates + 1
+               RETURNING (xmax = 0) AS inserted""",
+            (message_id, text if isinstance(text, str) else None, status, reason)).fetchone()
+    return row["inserted"]
+
+
+def claim():
+    with db() as conn:
+        return conn.execute(
+            """UPDATE messages SET status = 'processing', not_before = now() + %s * interval '1 second', updated_at = now()
+               WHERE message_id = (
+                   SELECT message_id FROM messages
+                   WHERE ((status = 'queued' AND (not_before IS NULL OR not_before <= now()))
+                       OR (status = 'processing' AND not_before < now()))   -- lease expired: worker died
+                     AND NOT (message_id = ANY(%s))
+                   ORDER BY received_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+               RETURNING message_id, text, attempts, llm_calls, llm_repeats, category""",
+            (LEASE_SECONDS, list(spooled_results))).fetchone()
+
+
+def save_result(message_id, fields, calls, repeat):
+    with db() as conn:
+        conn.execute(
+            """UPDATE messages SET status = 'completed', category = %(category)s, order_id = %(order_id)s,
+                   product = %(product)s, urgency = %(urgency)s, requested_action = %(requested_action)s,
+                   llm_raw = %(raw)s, attempts = attempts + 1, failure_reason = NULL,
+                   llm_calls = llm_calls + %(calls)s, llm_repeats = llm_repeats + %(repeat)s, updated_at = now()
+               WHERE message_id = %(id)s AND status <> 'completed'""",
+            {**fields, "id": message_id, "calls": calls, "repeat": repeat})
+
+
+def record_failure(message_id, reason, attempts):
+    final = attempts >= MAX_ATTEMPTS
+    with db() as conn:
+        conn.execute(
+            """UPDATE messages SET status = %s, attempts = %s, failure_reason = %s, llm_calls = llm_calls + 1,
+                   not_before = now() + %s * interval '1 second', updated_at = now()
+               WHERE message_id = %s""",
+            ("failed" if final else "queued", attempts, reason, 2 ** attempts, message_id))
+
+
+def release(message_id):
+    with db() as conn:
+        conn.execute("UPDATE messages SET status = 'queued', not_before = NULL WHERE message_id = %s AND status = 'processing'",
+                     (message_id,))
+
+
+# ---------- background threads ----------
+
+def worker():
+    while not stop.is_set():
+        if not (health["llm"] and health["storage"]):
+            time.sleep(1)
+            continue
+        try:
+            row = claim()
+        except psycopg.Error:
+            health["storage"] = False
+            continue
+        if not row:
+            time.sleep(0.5)
+            continue
+        mid = row["message_id"]
+        repeat = 1 if row["category"] else 0  # it already had a successful result once
+        try:
+            result, raw = llm.call(row["text"])
+        except llm.LLMUnavailable as e:
+            log.warning("LLM unavailable (%s); pausing, %s goes back to queue without using an attempt", e, mid)
+            health["llm"] = False
+            try_db(release, mid)
+            continue
+        except llm.BadOutput as e:
+            log.warning("%s attempt %d failed: %s", mid, row["attempts"] + 1, e)
+            try_db(record_failure, mid, str(e), row["attempts"] + 1)
+            continue
+        fields = {**result, "raw": raw[:4000]}
+        try:
+            save_result(mid, fields, 1, repeat)
+            log.info("%s completed: %s", mid, result["category"])
+        except psycopg.Error:
+            health["storage"] = False
+            spool({"kind": "result", "message_id": mid, "fields": fields, "calls": 1, "repeat": repeat})
+            log.warning("storage down; result for %s spooled to disk", mid)
+
+
+def try_db(fn, *args):
+    try:
+        fn(*args)
+    except psycopg.Error:
+        health["storage"] = False  # the lease will expire and the message is retried
+
+
+def monitor():
+    schema_ok = False
+    while not stop.is_set():
+        health["llm"] = llm.healthy()
+        try:
+            if not schema_ok:
+                ensure_schema()
+                schema_ok = True
+            with db() as conn:
+                conn.execute("SELECT 1")
+            health["storage"] = True
+            replay_spool()
+        except (psycopg.Error, OSError) as e:
+            if health["storage"]:
+                log.error("storage unavailable: %s", type(e).__name__)
+            health["storage"] = False
+        stop.wait(3)
+
+
+@asynccontextmanager
+async def lifespan(_):
+    load_spooled_results()
+    threads = [threading.Thread(target=monitor, daemon=True)] + \
+              [threading.Thread(target=worker, daemon=True) for _ in range(WORKERS)]
+    for t in threads:
+        t.start()
+    yield
+    stop.set()
+
+
+app = FastAPI(title="Ticket Desk", lifespan=lifespan)
+
+
+# ---------- HTTP ----------
+
+@app.post("/messages", status_code=202)
+async def receive(request: Request):
+    if int(request.headers.get("content-length") or 0) > MAX_BODY:
+        raise HTTPException(413, "message too large")
+    body = await request.body()
+    if len(body) > MAX_BODY:
+        raise HTTPException(413, "message too large")
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(400, "body is not valid JSON")
+    mid = payload.get("message_id") if isinstance(payload, dict) else None
+    if not isinstance(mid, str) or not mid.strip() or len(mid) > MAX_ID_LEN:
+        raise HTTPException(422, "message_id must be a non-empty string")
+    # Anything with a usable id is kept (bad text becomes 'rejected') so no message disappears.
+    text = payload.get("text")
+    try:
+        new = await run_in_threadpool(store_message, mid, text)
+    except psycopg.Error:
+        health["storage"] = False
+        spool({"kind": "msg", "message_id": mid, "text": text})
+        return {"message_id": mid, "accepted": True, "stored": "spool"}
+    return {"message_id": mid, "accepted": True, "duplicate": not new}
+
+
+def check_token(request: Request):
+    if OPS_TOKEN and not hmac.compare_digest(request.headers.get("x-ops-token", ""), OPS_TOKEN):
+        raise HTTPException(401, "ops token required")
+
+
+@app.post("/api/retry/{message_id}")
+def retry_one(message_id: str, request: Request):
+    check_token(request)
+    return {"requeued": requeue("AND message_id = %s", (message_id,))}
+
+
+@app.post("/api/retry-failed")
+def retry_all(request: Request):
+    check_token(request)
+    return {"requeued": requeue("", ())}
+
+
+def requeue(where, params):
+    try:
+        with db() as conn:
+            return conn.execute(
+                f"""UPDATE messages SET status = 'queued', attempts = 0, failure_reason = NULL, not_before = NULL,
+                       updated_at = now() WHERE status = 'failed' {where}""", params).rowcount
+    except psycopg.Error:
+        raise HTTPException(503, "storage unavailable, try again shortly")
+
+
+@app.get("/api/state")
+def state():
+    global last_state
+    out = {"health": dict(health), "spooled": spool_size(), "stale": False}
+    try:
+        with db() as conn:
+            t = conn.execute(
+                """SELECT count(*) AS received,
+                          count(*) FILTER (WHERE status IN ('queued', 'processing')) AS in_progress,
+                          count(*) FILTER (WHERE status = 'completed') AS completed,
+                          count(*) FILTER (WHERE status = 'failed') AS failed,
+                          count(*) FILTER (WHERE status = 'rejected') AS rejected,
+                          coalesce(sum(duplicates), 0) AS duplicates,
+                          coalesce(sum(llm_calls), 0) AS llm_calls,
+                          coalesce(sum(llm_repeats), 0) AS llm_repeats
+                   FROM messages""").fetchone()
+            rows = conn.execute(
+                """SELECT message_id, status, category, order_id, product, urgency, requested_action,
+                          attempts, failure_reason, duplicates, left(text, 160) AS text, updated_at
+                   FROM messages ORDER BY received_at DESC LIMIT 500""").fetchall()
+        last_state = {"totals": t, "messages": rows}
+    except psycopg.Error:
+        health["storage"] = False
+        out["health"]["storage"] = False
+        out["stale"] = True
+    return JSONResponse(json.loads(json.dumps({**out, **last_state}, default=str)))
+
+
+@app.get("/api/results")
+def results():
+    """The hand-in file: exactly one entry per message."""
+    try:
+        with db() as conn:
+            return conn.execute(
+                """SELECT message_id, status, category, order_id, product, urgency, requested_action
+                   FROM messages ORDER BY message_id""").fetchall()
+    except psycopg.Error:
+        raise HTTPException(503, "storage unavailable")
+
+
+@app.get("/")
+def index():
+    return FileResponse(Path(__file__).with_name("index.html"))
