@@ -175,3 +175,6 @@ because an outage says nothing about the model's answers.
 
 ## Afternoon change 6: one worker, enforced
 The worker holds a Postgres session advisory lock (`pg_try_advisory_lock(4242)`) on its own connection. A second worker (`--scale worker=2`) logs "waiting for worker lock" and never claims. If the DB restarts, the lock is re-taken before the next claim. The orphaned-`processing` reset now runs only after the lock is taken, so a waiting worker cannot steal the running worker's message.
+
+## Urgency does not change processing order
+Urgency is a label for the human support agents, not a scheduling input. The worker queue stays first-in, first-out by arrival (`ORDER BY attempts, received_at`: retries go behind fresh messages). Ordering by urgency would make processing order depend on an LLM guess, and urgency is only known after the extract call anyway.
