@@ -93,3 +93,8 @@ Tests: `tests/test_spool.py` (truncated line, torn tail plus new append, garbage
 - Proper message broker (or Postgres LISTEN/NOTIFY) instead of polling.
 - Accuracy evaluation set larger than 25 messages, and a second-pass "self-check" call for low-confidence cases.
 - Real auth for the ops screen, metrics export (Prometheus), structured logs.
+
+## Afternoon change 1: no "LLM DOWN" alert
+The red "LLM service is DOWN" banner is gone from the ops screen. The health check behind it stays: the worker
+still pauses while the LLM is unreachable and puts the message back without using an attempt. The LLM tile in
+the health row still shows UP/DOWN as plain status, so ops can see why the queue is not moving without an alarm.

@@ -71,7 +71,6 @@ async function refresh() {
   catch { document.getElementById("alerts").replaceChildren(el("div", "Service unreachable: the ticket service itself is down", "alert")); return; }
 
   const alerts = [];
-  if (!s.health.llm) alerts.push(el("div", "LLM service is DOWN: processing is paused and will resume automatically", "alert"));
   if (!s.health.storage) alerts.push(el("div", `Storage is DOWN: new messages are kept safely on disk (${s.spooled} waiting)` + (s.stale ? ", figures below may be stale" : ""), "alert"));
   const bad = s.quarantined || [];
   if (bad.length) alerts.push(el("div", `${bad.length} unreadable spool line(s) quarantined after a crash: review below`, "alert"));
