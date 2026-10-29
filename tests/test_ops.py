@@ -65,6 +65,17 @@ def test_audit_never_holds_api_key(monkeypatch):
     assert "sk-secret" not in str(a)
 
 
+def test_unreachable_endpoint_records_the_cause(monkeypatch):
+    def down(msgs):
+        raise llm.LLMUnavailable("HTTP 502")
+    monkeypatch.setattr(llm, "_chat", down)
+    try:
+        llm.classify("hi")
+    except llm.LLMUnavailable:
+        pass
+    assert llm.last["outcome"] == "unavailable" and llm.last["reason"] == "endpoint unreachable: HTTP 502"
+
+
 def test_outage_is_not_counted_against_the_model():
     counts = [{"stage": "extract", "outcome": o, "n": n} for o, n in
               (("passed", 3), ("corrected", 1), ("unavailable", 5))]

@@ -142,6 +142,7 @@ async function refreshAudit() {
     tile("Overall", pct(a.score.passed_unmodified)), tile("Classify", pct(st.classify?.passed_unmodified)),
     tile("Extract", pct(st.extract?.passed_unmodified)), tile("Passed", a.score.passed, "up"),
     tile("Corrected by code", a.score.corrected), tile("Rejected", a.score.rejected, "down"),
+    tile("Endpoint unreachable (not scored)", a.score.unavailable),
     ...a.corrected_fields.map(f => tile(f.field + " corrected", f.n)),
     ...(a.layers || []).filter(l => l.result === "fail").map(l => tile(l.layer + " check failed", l.n, "down")));
   const g = a.golden || {};

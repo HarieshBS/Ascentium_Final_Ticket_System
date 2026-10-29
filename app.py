@@ -537,7 +537,8 @@ def llm_audit():
             recent = conn.execute(
                 """SELECT message_id, stage, model, prompt_hash, outcome, reason, latency_ms,
                           left(raw_output, 300) AS raw_output, created_at
-                   FROM llm_audit WHERE outcome <> 'passed' ORDER BY created_at DESC LIMIT 50""").fetchall()
+                   FROM llm_audit WHERE outcome IN ('corrected', 'rejected')   -- outages are counted, not listed
+                   ORDER BY created_at DESC LIMIT 50""").fetchall()
             layers = conn.execute(
                 """SELECT key AS layer, value AS result, count(*) AS n FROM llm_audit, jsonb_each_text(checks)
                    GROUP BY 1, 2 ORDER BY 1, 2""").fetchall()

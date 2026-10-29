@@ -122,6 +122,9 @@ def _audited(stage, system, keys, text, clean):
     except BadOutput as e:
         last.update(outcome="rejected", reason=str(e), checks={"transport": "fail"})
         raise
+    except LLMUnavailable as e:
+        last["reason"] = f"endpoint unreachable: {e}"  # e.g. HTTP 502, ConnectError; never headers or keys
+        raise
     finally:
         last["latency_ms"] = int((time.monotonic() - t) * 1000)
     last["raw"] = raw[:4000]

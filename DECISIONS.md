@@ -169,3 +169,6 @@ The LLM state is back on the ops screen, but as a small pill in the health row (
 processing paused" in amber), not a red banner. That still gives a clear signal when the LLM is down, as page 5
 asks. It is not an alarm because an LLM outage loses nothing: the worker pauses and messages wait in the queue.
 Storage keeps its red banner because then messages are only on local disk.
+Follow-up: `unavailable` rows now store the cause (`endpoint unreachable: HTTP 502`, `ConnectError`, ...). They are
+shown as a count ("Endpoint unreachable, not scored") rather than in the list of corrected/rejected answers,
+because an outage says nothing about the model's answers.
