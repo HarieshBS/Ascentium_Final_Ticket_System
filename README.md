@@ -1,4 +1,6 @@
-# Ticket Intelligence System
+Project Kestrel
+
+# Kestrel Ticket Desk: Ticket Intelligence System
 
 Classifies incoming customer support messages and extracts order ID, product, urgency and requested
 action using a local open-source LLM (any OpenAI-compatible endpoint: the provided qwen3-4b, Ollama, llama.cpp, vLLM).

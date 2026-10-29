@@ -267,7 +267,7 @@ async def lifespan(_):
     stop.set()
 
 
-app = FastAPI(title="Ticket Desk", lifespan=lifespan)
+app = FastAPI(title="Kestrel Ticket Desk", lifespan=lifespan)
 
 
 # ---------- HTTP ----------
