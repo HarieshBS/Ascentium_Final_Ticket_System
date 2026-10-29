@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ import llm
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://tickets:tickets@localhost:5432/tickets")
 SPOOL = Path(os.environ.get("SPOOL_DIR", "spool")) / "spool.jsonl"
+BAD_SPOOL = SPOOL.with_suffix(".bad")  # unreadable spool lines (torn by a crash mid-write), kept for ops
 MAX_ATTEMPTS = 3
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
 OPS_TOKEN = os.environ.get("OPS_TOKEN", "")
@@ -85,8 +87,12 @@ def ensure_schema():
 def spool(record: dict):
     with spool_lock:
         SPOOL.parent.mkdir(parents=True, exist_ok=True)
-        with SPOOL.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        with SPOOL.open("a+b") as f:
+            if f.seek(0, 2):  # never glue a new record onto a torn last line left by a crash
+                f.seek(-1, 2)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
+            f.write((json.dumps(record) + "\n").encode())
             f.flush()
             os.fsync(f.fileno())
         if record["kind"] == "result":
@@ -98,18 +104,32 @@ def replay_spool():
     with spool_lock:
         if not SPOOL.exists():
             return
-        lines = SPOOL.read_text(encoding="utf-8").splitlines()
-        done = 0
+        lines = read_lines(SPOOL)
+        done, bad = 0, []
         try:
             for line in lines:
-                rec = json.loads(line)
-                if rec["kind"] == "msg":
-                    store_message(rec["message_id"], rec["text"])
+                try:
+                    rec = json.loads(line)
+                    mid, kind = rec["message_id"], rec["kind"]
+                    args = (mid, rec["text"]) if kind == "msg" else (mid, rec["fields"], rec["calls"])
+                except (ValueError, TypeError, KeyError):
+                    bad.append(line)  # quarantined below; must not block the lines after it
+                    done += 1
+                    continue
+                if kind == "msg":
+                    store_message(*args)
                 else:
-                    save_result(rec["message_id"], rec["fields"], rec["calls"])
-                    spooled_results.discard(rec["message_id"])
+                    save_result(*args)
+                    spooled_results.discard(mid)
                 done += 1
         finally:
+            if bad:
+                # Written before the spool shrinks. ponytail: a crash in between quarantines the line twice; harmless.
+                with BAD_SPOOL.open("a", encoding="utf-8") as f:
+                    f.write("".join(l + "\n" for l in bad))
+                    f.flush()
+                    os.fsync(f.fileno())
+                log.error("quarantined %d unreadable spool line(s) to %s", len(bad), BAD_SPOOL)
             rest = lines[done:]
             tmp = SPOOL.with_suffix(".tmp")
             tmp.write_text("".join(l + "\n" for l in rest), encoding="utf-8")
@@ -118,17 +138,42 @@ def replay_spool():
         log.info("replayed %d spooled records", done)
 
 
+def read_lines(path: Path) -> list[str]:
+    # errors="replace": a torn write can end mid-character
+    return path.read_text(encoding="utf-8", errors="replace").splitlines() if path.exists() else []
+
+
 def spool_size() -> int:
     with spool_lock:
-        return len(SPOOL.read_text(encoding="utf-8").splitlines()) if SPOOL.exists() else 0
+        return len(read_lines(SPOOL))
 
 
 def load_spooled_results():
-    if SPOOL.exists():
-        for line in SPOOL.read_text(encoding="utf-8").splitlines():
+    for line in read_lines(SPOOL):
+        try:
             rec = json.loads(line)
             if rec["kind"] == "result":
                 spooled_results.add(rec["message_id"])
+        except (ValueError, TypeError, KeyError):
+            pass  # torn line: replay_spool quarantines it
+
+
+ID_IN_LINE = re.compile(r'"message_id": "((?:[^"\\]|\\.)*)"')
+
+
+def quarantined() -> list[dict]:
+    """Quarantined lines with the message_id salvaged where it survived (it is written before the text)."""
+    with spool_lock:
+        lines = read_lines(BAD_SPOOL)
+    out = []
+    for line in lines:
+        m = ID_IN_LINE.search(line)
+        try:
+            mid = json.loads(f'"{m[1]}"') if m else None
+        except ValueError:
+            mid = None
+        out.append({"message_id": mid, "preview": line[:120]})
+    return out
 
 
 # ---------- storage operations ----------
@@ -333,6 +378,17 @@ def retry_all(request: Request):
     return {"requeued": requeue("", ())}
 
 
+@app.post("/api/quarantine/clear")
+def clear_quarantine(request: Request):
+    """Ops has reviewed the quarantined lines. The file is renamed, never deleted."""
+    check_token(request)
+    with spool_lock:
+        n = len(read_lines(BAD_SPOOL))
+        if n:
+            BAD_SPOOL.rename(BAD_SPOOL.with_name(f"{BAD_SPOOL.name}.{int(time.time())}.reviewed"))
+    return {"cleared": n}
+
+
 def requeue(where, params):
     try:
         with db() as conn:
@@ -346,9 +402,16 @@ def requeue(where, params):
 @app.get("/api/state")
 def state():
     global last_state
-    out = {"health": dict(health), "spooled": spool_size(), "stale": False}
+    bad = quarantined()
+    out = {"health": dict(health), "spooled": spool_size(), "quarantined": bad, "stale": False}
     try:
         with db() as conn:
+            if bad:  # did the sender resend it since? (a torn line was never acknowledged)
+                known = {r["message_id"] for r in conn.execute(
+                    "SELECT message_id FROM messages WHERE message_id = ANY(%s)",
+                    ([b["message_id"] for b in bad if b["message_id"]],))}
+                for b in bad:
+                    b["in_storage"] = b["message_id"] in known
             t = conn.execute(
                 """SELECT count(*) AS received,
                           count(*) FILTER (WHERE status IN ('queued', 'processing')) AS in_progress,

@@ -33,6 +33,12 @@
 <h2>Failed messages <button id="retryAll">Retry all failed</button></h2>
 <div class="wrap"><table><thead><tr><th>ID</th><th>Attempts</th><th>Reason</th><th>Text</th><th></th></tr></thead><tbody id="failed"></tbody></table></div>
 
+<section id="quarantine" hidden>
+<h2>Quarantined spool lines <button id="clearBad">Mark reviewed</button></h2>
+<p class="muted">Lines torn by a crash while being written to disk. A torn line was never acknowledged, so the sender resends it; "missing" means it has not arrived again yet.</p>
+<div class="wrap"><table><thead><tr><th>Salvaged ID</th><th>Arrived again?</th><th>Raw line</th></tr></thead><tbody id="bad"></tbody></table></div>
+</section>
+
 <h2>All messages <span class="muted">(latest 500)</span></h2>
 <div class="wrap"><table><thead><tr><th>ID</th><th>Status</th><th>Category</th><th>Order</th><th>Product</th><th>Urgency</th><th>Action</th><th>Attempts</th><th>Dupes</th><th>Failure reason</th></tr></thead><tbody id="all"></tbody></table></div>
 
@@ -53,10 +59,11 @@ async function post(url) {
     sessionStorage.setItem("opsToken", t);
     r = await fetch(url, { method: "POST", headers: { "x-ops-token": t } });
   }
-  if (!r.ok) alert("Retry failed: " + r.status);
+  if (!r.ok) alert("Request failed: " + r.status);
   refresh();
 }
 document.getElementById("retryAll").onclick = () => post("/api/retry-failed");
+document.getElementById("clearBad").onclick = () => post("/api/quarantine/clear");
 
 async function refresh() {
   let s;
@@ -66,7 +73,16 @@ async function refresh() {
   const alerts = [];
   if (!s.health.llm) alerts.push(el("div", "LLM service is DOWN: processing is paused and will resume automatically", "alert"));
   if (!s.health.storage) alerts.push(el("div", `Storage is DOWN: new messages are kept safely on disk (${s.spooled} waiting)` + (s.stale ? ", figures below may be stale" : ""), "alert"));
+  const bad = s.quarantined || [];
+  if (bad.length) alerts.push(el("div", `${bad.length} unreadable spool line(s) quarantined after a crash: review below`, "alert"));
   document.getElementById("alerts").replaceChildren(...alerts);
+  document.getElementById("quarantine").hidden = !bad.length;
+  document.getElementById("bad").replaceChildren(...bad.map(b => {
+    const tr = el("tr");
+    tr.append(el("td", b.message_id ?? "(id unreadable)"),
+      el("td", b.in_storage == null ? "?" : b.in_storage ? "yes" : "missing", b.in_storage === false ? "s-failed" : ""), el("td", b.preview));
+    return tr;
+  }));
 
   document.getElementById("health").replaceChildren(
     tile("LLM service", s.health.llm ? "UP" : "DOWN", s.health.llm ? "up" : "down"),
