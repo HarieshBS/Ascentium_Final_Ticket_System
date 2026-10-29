@@ -85,9 +85,12 @@ itself if it does not exist, are created automatically.
 
 ```bash
 curl http://localhost:8001/api/results -o results.json   # without Docker: port 8000
+python check_results.py results.json ../final_round/for_candidates/practice_messages.json
 ```
 
-One entry per message: `message_id, status, category, order_id, product, urgency, requested_action`.
+One entry per message with every field `output_schema.json` requires (`attempts` and `failure_reason` included). `check_results.py` (stdlib only) checks one entry per input id, the enums, the ORD-NNNNN format and types. PowerShell: `Invoke-WebRequest -UseBasicParsing http://localhost:8001/api/results -OutFile results.json` (`-OutFile` keeps the bytes exact; piping through `ConvertTo-Json` adds a BOM).
+
+The API is the primary interface: it reads Postgres directly, so it is always current and can be put behind auth or a proxy. results.json in the repo is the snapshot of the final practice run.
 
 ## Operations
 

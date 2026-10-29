@@ -185,3 +185,22 @@ Ops screen: the "All messages" table still shows the latest 500, but the Failed 
 - `/api/results` now includes `attempts` and `failure_reason`, which `output_schema.json` requires.
 - Ops screen: a "show every message" toggle lifts the 500-row limit on the All messages table (`/api/state?all=true`).
 - results.json is generated from the API on a fresh database and committed as the hand-in. The API is the source of truth: it reads Postgres directly, and the file is a snapshot of it.
+
+## Decisions made today (summary)
+Each line points to the section with the reasoning.
+| Decision | Decided by |
+|---|---|
+| One worker, no parallel LLM calls (4 GB VRAM). Enforced by the advisory lock in "Afternoon change 6" | Panel |
+| Classify and extract as two separate LLM calls; a saved category is never recomputed ("Review feedback (11:30)") | Panel |
+| Kestrel naming ("The Kestrel naming requirement") | Brief |
+| Order id only when ORD/order precedes the 5 digits; a bare `#48213` is missed on purpose ("Extraction guards") | Candidate |
+| Whole-word product matching against the catalogue ("Extraction guards") | Candidate |
+| fsync'd spool when storage is down, torn lines quarantined to `.bad` for review ("Crash mid-write") | Candidate |
+| Separate containers so ingest never stops accepting ("Afternoon change 3") | Candidate (afternoon requirement) |
+| LLM audit tracker with credibility score ("Afternoon change 2") plus schema, regex and grounding checks, no LLM-as-judge ("Afternoon change 4") | Candidate (afternoon requirement) |
+| Quiet LLM status pill, no banner ("Afternoon change 1" and "5") | Panel |
+| Urgency is a label for human agents; the queue stays FIFO ("Urgency does not change processing order") | Candidate |
+| Input fields outside the schema are stored as `rejected` ("Final changes before freeze") | Candidate |
+| Latest-500 / all-messages toggle on the ops screen ("Final changes before freeze") | Candidate |
+| 3 attempts with back-off, then `failed` with the reason; ops can retry one or all ("Status meanings", README Operations) | Brief |
+| results.json generated from the API on a fresh database, validated by `check_results.py`, committed ("Final changes before freeze") | Candidate |
