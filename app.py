@@ -95,7 +95,7 @@ def spool(record: dict):
             f.write((json.dumps(record) + "\n").encode())
             f.flush()
             os.fsync(f.fileno())
-        if record["kind"] == "result":
+        if record["kind"] != "msg":
             spooled_results.add(record["message_id"])
 
 
@@ -111,16 +111,13 @@ def replay_spool():
                 try:
                     rec = json.loads(line)
                     mid, kind = rec["message_id"], rec["kind"]
-                    args = (mid, rec["text"]) if kind == "msg" else (mid, rec["fields"], rec["calls"])
+                    args = {"msg": lambda: (mid, rec["text"]), "class": lambda: (mid, rec["category"], rec["calls"]),
+                            "result": lambda: (mid, rec["fields"], rec["calls"])}[kind]()
                 except (ValueError, TypeError, KeyError):
                     bad.append(line)  # quarantined below; must not block the lines after it
                     done += 1
                     continue
-                if kind == "msg":
-                    store_message(*args)
-                else:
-                    save_result(*args)
-                    spooled_results.discard(mid)
+                {"msg": store_message, "class": save_classification, "result": save_result}[kind](*args)
                 done += 1
         finally:
             if bad:
@@ -134,6 +131,8 @@ def replay_spool():
             tmp = SPOOL.with_suffix(".tmp")
             tmp.write_text("".join(l + "\n" for l in rest), encoding="utf-8")
             os.replace(tmp, SPOOL)
+            spooled_results.clear()
+            load_spooled_results()  # ids still waiting on disk stay held back from the queue
     if done:
         log.info("replayed %d spooled records", done)
 
@@ -152,7 +151,7 @@ def load_spooled_results():
     for line in read_lines(SPOOL):
         try:
             rec = json.loads(line)
-            if rec["kind"] == "result":
+            if rec["kind"] != "msg":
                 spooled_results.add(rec["message_id"])
         except (ValueError, TypeError, KeyError):
             pass  # torn line: replay_spool quarantines it
@@ -273,7 +272,10 @@ def worker():
                     save_classification(mid, category, calls)
                     calls = 0
                 except psycopg.Error:
-                    health["storage"] = False  # carried in the final result / spool instead
+                    # Storage died between the two calls: keep the category on disk so it is never recomputed.
+                    health["storage"] = False
+                    spool({"kind": "class", "message_id": mid, "category": category, "calls": calls})
+                    calls = 0
             stage = "extract"
             details, raw = llm.extract(text)
             calls += 1

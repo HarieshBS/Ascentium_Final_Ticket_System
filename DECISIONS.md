@@ -44,7 +44,8 @@ benefit. I am mentioning it openly here and in the review rather than applying i
   without touching the other. Urgency belongs to extraction, as the brief lists it as an extracted detail.
 - **Classification is saved before extraction starts.** If extraction fails, the retry skips straight to
   extraction. A retry from the ops screen also keeps the saved category. If storage is down at that moment,
-  the category travels with the final result (or the spool), so it is still not recomputed.
+  the category is written to the local spool and replayed when storage returns; the message is held back
+  from the queue until then, so it is still not recomputed.
 - **Attempts are per message, not per call.** A bad answer from either call uses one of the message's 3
   attempts, and `failure_reason` says which stage failed (`classify: …` / `extract: …`). Per-call budgets
   would let a message burn up to 6 slow LLM calls before failing, against the brief's "fails 3 times".
