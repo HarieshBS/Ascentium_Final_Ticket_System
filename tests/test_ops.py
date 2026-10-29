@@ -107,3 +107,7 @@ def test_each_service_serves_only_its_routes(monkeypatch):
     assert routes_for(monkeypatch, "worker") == {"/healthz": 200, "/": 404, "/api/llm-audit": 404, "POST /messages": 404}
     ops = routes_for(monkeypatch, "ops")
     assert ops["/"] == 200 and ops["POST /messages"] == 404
+
+
+def test_outages_show_whether_the_retry_resolved_them():
+    assert "resolved on retry (completed)" in INDEX and "not resolved (failed)" in INDEX

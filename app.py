@@ -539,6 +539,10 @@ def llm_audit():
                           left(raw_output, 300) AS raw_output, created_at
                    FROM llm_audit WHERE outcome IN ('corrected', 'rejected')   -- outages are counted, not listed
                    ORDER BY created_at DESC LIMIT 50""").fetchall()
+            outages = conn.execute(  # joined to the message's current status: was the call resolved by a retry?
+                """SELECT a.message_id, a.stage, a.reason, a.created_at, m.status
+                   FROM llm_audit a LEFT JOIN messages m USING (message_id)
+                   WHERE a.outcome = 'unavailable' ORDER BY a.created_at DESC LIMIT 50""").fetchall()
             layers = conn.execute(
                 """SELECT key AS layer, value AS result, count(*) AS n FROM llm_audit, jsonb_each_text(checks)
                    GROUP BY 1, 2 ORDER BY 1, 2""").fetchall()
@@ -551,7 +555,7 @@ def llm_audit():
         {"score": credibility(counts), "by_stage": {s: credibility([c for c in counts if c["stage"] == s])
                                                     for s in {c["stage"] for c in counts}},
          "layers": layers, "golden": golden_score(stored),
-         "counts": counts, "corrected_fields": fields, "recent_issues": recent}, default=str)))
+         "counts": counts, "corrected_fields": fields, "recent_issues": recent, "outages": outages}, default=str)))
 
 
 def golden_score(stored) -> dict:

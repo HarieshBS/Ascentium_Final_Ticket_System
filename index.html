@@ -43,6 +43,10 @@
 
 <h2>LLM credibility <span class="muted">(share of answers used exactly as the model gave them)</span></h2>
 <div class="row" id="audit" aria-live="polite"></div>
+<details><summary>Calls lost to an unreachable LLM endpoint (not scored)</summary>
+<div class="wrap"><table><thead><tr><th>ID</th><th>Stage</th><th>Cause</th><th>When</th><th>Resolved?</th></tr></thead><tbody id="outages"></tbody></table></div>
+</details>
+
 <h2>Golden set <span class="muted">(practice messages vs hand-checked answers)</span></h2>
 <div class="row" id="golden" aria-live="polite"></div>
 <p class="muted" id="goldenMisses"></p>
@@ -145,6 +149,15 @@ async function refreshAudit() {
     tile("Endpoint unreachable (not scored)", a.score.unavailable),
     ...a.corrected_fields.map(f => tile(f.field + " corrected", f.n)),
     ...(a.layers || []).filter(l => l.result === "fail").map(l => tile(l.layer + " check failed", l.n, "down")));
+  // The message's current status says whether the retry after the outage worked.
+  const resolved = { completed: ["resolved on retry (completed)", "s-completed"], queued: ["waiting for retry", "s-queued"],
+    processing: ["retrying now", "s-processing"], failed: ["not resolved (failed)", "s-failed"] };
+  document.getElementById("outages").replaceChildren(...(a.outages || []).map(o => {
+    const [label, cls] = resolved[o.status] || [o.status ?? "unknown", ""], tr = el("tr");
+    tr.append(el("td", o.message_id), el("td", o.stage), el("td", o.reason ?? "cause not recorded (before 05ecf96)"),
+      el("td", new Date(o.created_at).toLocaleTimeString()), el("td", label, cls));
+    return tr;
+  }));
   const g = a.golden || {};
   document.getElementById("golden").replaceChildren(...(g.scored ? ["category", "order_id", "product", "urgency"].map(
     f => tile(f.replace("_", " "), `${g[f]}/${g.scored}`, g[f] === g.scored ? "up" : "down")) : [el("span", "No practice messages processed yet", "muted")]));
