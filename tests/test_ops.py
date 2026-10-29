@@ -115,3 +115,22 @@ def test_outages_show_whether_the_retry_resolved_them():
 
 def test_failed_list_is_not_limited_to_the_latest_500():
     assert "s.failed" in INDEX and 'msgs.filter(m => m.status === "failed")' not in INDEX
+
+
+def test_extra_input_fields_are_stored_as_rejected(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(app, "ROLE", "all")
+    seen = []
+    monkeypatch.setattr(app, "store_message", lambda mid, text, invalid=None: seen.append(invalid) or True)
+    c = TestClient(app.app)
+    assert c.post("/messages", json={"message_id": "m1", "text": "hi", "foo": 1}).status_code == 202
+    assert c.post("/messages", json={"message_id": "m2", "text": "hi"}).status_code == 202
+    assert seen == ["unknown field(s): foo", None]
+
+
+def test_results_have_every_field_the_output_schema_requires():
+    import inspect
+    src = inspect.getsource(app.results)
+    for f in ("message_id", "status", "category", "order_id", "product", "urgency", "requested_action",
+              "attempts", "failure_reason"):
+        assert f in src

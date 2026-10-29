@@ -11,7 +11,7 @@ def stored(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "SPOOL", tmp_path / "spool.jsonl")
     monkeypatch.setattr(app, "BAD_SPOOL", tmp_path / "spool.bad")
     calls = []
-    monkeypatch.setattr(app, "store_message", lambda mid, text: calls.append(mid))
+    monkeypatch.setattr(app, "store_message", lambda mid, text, invalid=None: calls.append(mid))
     monkeypatch.setattr(app, "save_result", lambda mid, fields, n: calls.append(mid))
     return calls
 
@@ -51,7 +51,7 @@ def test_wrong_shaped_lines_are_quarantined_not_replayed(stored, garbage):
 
 
 def test_storage_failure_still_keeps_the_rest_in_the_spool(stored, monkeypatch):
-    def down(mid, text):
+    def down(mid, text, invalid=None):
         raise app.psycopg.OperationalError("down")
     monkeypatch.setattr(app, "store_message", down)
     app.SPOOL.write_text("{torn\n" + line("m1"), encoding="utf-8")

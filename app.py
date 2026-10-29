@@ -150,7 +150,7 @@ def replay_spool():
                 try:
                     rec = json.loads(line)
                     mid, kind = rec["message_id"], rec["kind"]
-                    args = {"msg": lambda: (mid, rec["text"]), "class": lambda: (mid, rec["category"], rec["calls"]),
+                    args = {"msg": lambda: (mid, rec["text"], rec.get("invalid")), "class": lambda: (mid, rec["category"], rec["calls"]),
                             "result": lambda: (mid, rec["fields"], rec["calls"]), "audit": lambda: (rec["audit"],)}[kind]()
                 except (ValueError, TypeError, KeyError):
                     bad.append(line)  # quarantined below; must not block the lines after it
@@ -218,9 +218,11 @@ def quarantined() -> list[dict]:
 
 # ---------- storage operations ----------
 
-def store_message(message_id: str, text) -> bool:
+def store_message(message_id: str, text, invalid: str | None = None) -> bool:
     """Insert once; a repeat only bumps the duplicate counter. Returns True if new."""
-    if not isinstance(text, str):
+    if invalid:
+        status, reason = "rejected", invalid
+    elif not isinstance(text, str):
         status, reason = "rejected", "text is not a string"
     elif not text.strip():
         status, reason = "rejected", "empty message"
@@ -457,11 +459,14 @@ async def receive(request: Request):
         raise HTTPException(422, "message_id must be a non-empty string")
     # Anything with a usable id is kept (bad text becomes 'rejected') so no message disappears.
     text = payload.get("text")
+    # input_schema.json has additionalProperties: false. Kept and marked rejected (not a 422) so it is visible to ops.
+    extra = sorted(set(payload) - {"message_id", "text"})
+    invalid = f"unknown field(s): {', '.join(extra)}"[:200] if extra else None
     try:
-        new = await run_in_threadpool(store_message, mid, text)
+        new = await run_in_threadpool(store_message, mid, text, invalid)
     except psycopg.Error:
         health["storage"] = False
-        spool({"kind": "msg", "message_id": mid, "text": text})
+        spool({"kind": "msg", "message_id": mid, "text": text, "invalid": invalid})
         return {"message_id": mid, "accepted": True, "stored": "spool"}
     return {"message_id": mid, "accepted": True, "duplicate": not new}
 
@@ -506,7 +511,7 @@ def requeue(where, params):
 
 
 @app.get("/api/state")
-def state():
+def state(all: bool = False):
     global last_state
     bad = quarantined()
     out = {"health": dict(health), "spooled": spool_size(), "quarantined": bad, "stale": False}
@@ -531,7 +536,7 @@ def state():
             rows = conn.execute(
                 """SELECT message_id, status, category, order_id, product, urgency, requested_action,
                           attempts, failure_reason, duplicates, left(text, 160) AS text, updated_at
-                   FROM messages ORDER BY received_at DESC LIMIT 500""").fetchall()
+                   FROM messages ORDER BY received_at DESC""" + ("" if all else " LIMIT 500")).fetchall()
             # Every failed message, not just those among the latest 500: ops must be able to retry all of them.
             failed = conn.execute(
                 """SELECT message_id, attempts, failure_reason, left(text, 160) AS text
@@ -550,7 +555,8 @@ def results():
     try:
         with db() as conn:
             return conn.execute(
-                """SELECT message_id, status, category, order_id, product, urgency, requested_action
+                """SELECT message_id, status, category, order_id, product, urgency, requested_action,
+                          attempts, failure_reason
                    FROM messages ORDER BY message_id""").fetchall()
     except psycopg.Error:
         raise HTTPException(503, "storage unavailable")

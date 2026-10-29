@@ -63,7 +63,7 @@
 <div class="wrap"><table><thead><tr><th>Salvaged ID</th><th>Arrived again?</th><th>Raw line</th></tr></thead><tbody id="bad"></tbody></table></div>
 </section>
 
-<h2>All messages <span class="muted">(latest 500)</span></h2>
+<h2>All messages <label class="muted"><input type="checkbox" id="showAll"> show every message (off: latest 500)</label></h2>
 <div class="wrap"><table><thead><tr><th>ID</th><th>Status</th><th>Category</th><th>Order</th><th>Product</th><th>Urgency</th><th>Action</th><th>Attempts</th><th>Dupes</th><th>Failure reason</th></tr></thead><tbody id="all"></tbody></table></div>
 
 <script>
@@ -91,7 +91,7 @@ document.getElementById("clearBad").onclick = () => post("/api/quarantine/clear"
 
 async function refresh() {
   let s;
-  try { s = await (await fetch("/api/state")).json(); }
+  try { s = await (await fetch("/api/state" + (document.getElementById("showAll").checked ? "?all=true" : ""))).json(); }
   catch { document.getElementById("alerts").replaceChildren(el("div", "Service unreachable: the ticket service itself is down", "alert")); return; }
 
   const alerts = [];
