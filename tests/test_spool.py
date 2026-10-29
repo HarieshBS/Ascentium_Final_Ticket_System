@@ -69,3 +69,51 @@ def test_clear_renames_instead_of_deleting(stored, monkeypatch):
     assert app.clear_quarantine(type("R", (), {"headers": {}})())["cleared"] == 1
     assert not app.BAD_SPOOL.exists()
     assert [p.read_text() for p in app.BAD_SPOOL.parent.glob("spool.bad.*.reviewed")] == ["{torn\n"]
+
+
+def test_category_survives_storage_outage_between_the_two_calls(tmp_path, monkeypatch):
+    """Classify succeeds, storage dies, extract fails. After replay the retry runs extract only."""
+    monkeypatch.setattr(app, "SPOOL", tmp_path / "spool.jsonl")
+    monkeypatch.setattr(app, "BAD_SPOOL", tmp_path / "spool.bad")
+    monkeypatch.setattr(app, "spooled_results", set())
+    monkeypatch.setattr(app, "stop", app.threading.Event())
+    monkeypatch.setattr(app, "health", {"llm": True, "storage": True})
+    monkeypatch.setattr(app.time, "sleep", lambda s: None)
+    db = {"category": None, "completed": None}
+    llm_calls = []
+
+    def down(*a):
+        raise app.psycopg.OperationalError("down")
+
+    def claim():
+        if db["completed"] or app.stop.is_set():
+            app.stop.set()
+            return None
+        return {"message_id": "m1", "text": "refund please", "attempts": 0, "category": db["category"]}
+
+    def extract(text):
+        llm_calls.append("extract")
+        if len(llm_calls) == 2:  # first extract fails while storage is down
+            app.stop.set()
+            raise app.llm.BadOutput("bad")
+        return {"order_id": None, "product": None, "urgency": "Medium", "requested_action": "refund"}, "{}"
+
+    monkeypatch.setattr(app, "claim", claim)
+    monkeypatch.setattr(app.llm, "classify", lambda text: (llm_calls.append("classify"), ("Refund", "{}"))[1])
+    monkeypatch.setattr(app.llm, "extract", extract)
+    monkeypatch.setattr(app, "save_classification", down)
+    monkeypatch.setattr(app, "record_failure", down)
+    app.worker()
+
+    assert app.spooled_results == {"m1"}  # held back from the queue while only the spool has the category
+
+    monkeypatch.setattr(app, "save_classification", lambda mid, cat, n: db.update(category=cat))
+    monkeypatch.setattr(app, "save_result", lambda mid, fields, n: db.update(completed=fields))
+    app.replay_spool()
+    assert db["category"] == "Refund" and app.spooled_results == set()
+
+    app.stop.clear()
+    app.health["storage"] = True  # the monitor does this once storage answers again
+    app.worker()
+    assert llm_calls == ["classify", "extract", "extract"]  # no second classify call
+    assert db["completed"]["category"] == "Refund"
