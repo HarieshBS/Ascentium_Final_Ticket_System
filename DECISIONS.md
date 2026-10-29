@@ -178,3 +178,4 @@ The worker holds a Postgres session advisory lock (`pg_try_advisory_lock(4242)`)
 
 ## Urgency does not change processing order
 Urgency is a label for the human support agents, not a scheduling input. The worker queue stays first-in, first-out by arrival (`ORDER BY attempts, received_at`: retries go behind fresh messages). Ordering by urgency would make processing order depend on an LLM guess, and urgency is only known after the extract call anyway.
+Ops screen: the "All messages" table still shows the latest 500, but the Failed list now comes from its own query over every failed message, so none can be missed for retry. Full history: `GET /api/results`.

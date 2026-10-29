@@ -532,7 +532,11 @@ def state():
                 """SELECT message_id, status, category, order_id, product, urgency, requested_action,
                           attempts, failure_reason, duplicates, left(text, 160) AS text, updated_at
                    FROM messages ORDER BY received_at DESC LIMIT 500""").fetchall()
-        last_state = {"totals": t, "messages": rows}
+            # Every failed message, not just those among the latest 500: ops must be able to retry all of them.
+            failed = conn.execute(
+                """SELECT message_id, attempts, failure_reason, left(text, 160) AS text
+                   FROM messages WHERE status = 'failed' ORDER BY updated_at DESC""").fetchall()
+        last_state = {"totals": t, "messages": rows, "failed": failed}
     except psycopg.Error:
         health["storage"] = False
         out["health"]["storage"] = False

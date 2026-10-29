@@ -120,7 +120,7 @@ async function refresh() {
     tile("LLM calls", t.llm_calls ?? "?"), tile("Repeat LLM calls", t.llm_repeats ?? "?"));
 
   const msgs = s.messages || [];
-  document.getElementById("failed").replaceChildren(...msgs.filter(m => m.status === "failed").map(m => {
+  document.getElementById("failed").replaceChildren(...(s.failed || []).map(m => {
     const tr = el("tr"), b = el("button", "Retry");
     b.onclick = () => post("/api/retry/" + encodeURIComponent(m.message_id));
     b.setAttribute("aria-label", "Retry " + m.message_id);

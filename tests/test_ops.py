@@ -111,3 +111,7 @@ def test_each_service_serves_only_its_routes(monkeypatch):
 
 def test_outages_show_whether_the_retry_resolved_them():
     assert "resolved on retry (completed)" in INDEX and "not resolved (failed)" in INDEX
+
+
+def test_failed_list_is_not_limited_to_the_latest_500():
+    assert "s.failed" in INDEX and 'msgs.filter(m => m.status === "failed")' not in INDEX
