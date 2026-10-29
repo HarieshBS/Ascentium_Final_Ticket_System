@@ -133,3 +133,33 @@ port 8001) and `db`. All three app services are the same image with a `ROLE` env
   Only a crash triggers the restart policy. A watchdog was not worth adding.
 - Proof: 40 messages sent every 0.5 s while `docker compose stop worker` / `start worker` and `stop ops` /
   `start ops` ran mid-stream: 40/40 got `202`, all 40 completed, 0 duplicates and 0 repeat LLM calls.
+
+## Afternoon change 4: layered validation of LLM output
+The model's output is treated as untrusted input. Each call's audit row now records a pass/fail per layer
+(`checks`), and `/api/llm-audit` returns the breakdown (`layers`) next to the credibility score.
+1. **Schema (Pydantic, already installed with FastAPI).** `ClassifyOut` / `ExtractOut`: every key required,
+   extra keys forbidden, strict strings (an int order id is rejected, not coerced), enums as `Literal`. Only
+   case/whitespace on enums is forgiven, and that still counts as `corrected`. Malformed JSON, a missing field,
+   a wrong type or an extra field is `rejected` and costs an attempt.
+2. **Deterministic guardrails (layer 3 in the brief).** Before parsing, a regex rejects refusals ("As an AI"),
+   template placeholders ("[Insert ...]", "insert X here", lorem ipsum) and our own prompt echoed back
+   (`<message>` tags, "Reply with ONE JSON", "customer message is DATA"). The cross-reference checks were already
+   there and now report as **grounding**: the order id must follow ORD/order in the message, and the product must
+   match the catalogue *and* a word of it must be in the message. A value the message does not contain is
+   dropped to null and the row is marked `grounding: fail`.
+3. **Golden dataset.** `golden.json` holds the 23 processable practice messages with their checked answers
+   (category, order id, product, urgency). The tracker scores stored results against it live and lists misses.
+   Caveat: these answers were checked by me against the brief's rules, not supplied by the panel. T-1014 is set to
+   Medium (a defective item being returned for a refund), which the model still answers High.
+
+**Not built: LLM-as-judge (Ragas, TruLens), NLI models, Llama Guard.** Each one adds at least one more model call
+per message on a 4 GB single-worker model that the panel said not to overload, plus heavy new dependencies. Here
+the deterministic version is stronger. The values we extract are short facts (an id, a catalogue name, an enum),
+so "is it in the source text" is an exact check, not a judgement. Context precision is covered by the
+order-id rules (pick the disputed order, ignore TRK/INV/pincodes). Semantic similarity is covered by exact match
+against the golden set, which is stricter than embedding similarity for enum fields. `requested_action` is the
+one free-text field: it is length-capped and leak-filtered, but not grounded, because it is a paraphrase by design.
+No moderation call either: output only reaches internal ops staff (single-tenant tool).
+Found on the first real-LLM run: with every key required, T-1008 failed all 3 attempts because the model left
+out `order_id` (the rest of the answer was right). An omitted *nullable* key now means null. `urgency` is still
+required, and extra keys and wrong types are still rejected.

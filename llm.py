@@ -5,8 +5,10 @@ import json
 import os
 import re
 import time
+from typing import Literal, Optional
 
 import httpx
+from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError, field_validator
 
 BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:11434").rstrip("/")
 MODEL = os.environ.get("LLM_MODEL", "qwen3-4b")
@@ -113,12 +115,12 @@ def _audited(stage, system, keys, text, clean):
     """Call the model and record whether its answer was used as is, corrected by code, or rejected."""
     last.clear()
     last.update(stage=stage, model=MODEL, prompt_hash=PROMPT_HASH[stage], raw=None, latency_ms=None,
-                outcome="unavailable", reason=None, fields=[], at=time.time())
+                outcome="unavailable", reason=None, fields=[], checks={}, at=time.time())
     t = time.monotonic()
     try:
         raw = _chat(build_messages(system, keys, text))
     except BadOutput as e:
-        last.update(outcome="rejected", reason=str(e))
+        last.update(outcome="rejected", reason=str(e), checks={"transport": "fail"})
         raise
     finally:
         last["latency_ms"] = int((time.monotonic() - t) * 1000)
@@ -126,11 +128,16 @@ def _audited(stage, system, keys, text, clean):
     try:
         cleaned = clean(raw)
     except BadOutput as e:
-        last.update(outcome="rejected", reason=str(e))
+        layer = "guardrail" if str(e).startswith("guardrail") else "schema"
+        last.update(outcome="rejected", reason=str(e),
+                    checks={"guardrail": "fail"} if layer == "guardrail" else {"guardrail": "pass", "schema": "fail"})
         raise
     said = parse(raw)
     fixed = [k for k, v in cleaned.items() if said.get(k) != v]
+    # Grounding fails when code had to drop a value the model gave because the message does not contain it.
+    dropped = [k for k in fixed if cleaned[k] is None and said.get(k) is not None]
     last.update(outcome="corrected" if fixed else "passed", fields=fixed,
+                checks={"guardrail": "pass", "schema": "pass", "grounding": "fail" if dropped else "pass"},
                 reason="; ".join(f"{k}: {said.get(k)!r} -> {cleaned[k]!r}" for k in fixed)[:500] or None)
     return cleaned, raw
 
@@ -154,8 +161,15 @@ def _chat(messages: list) -> str:
         raise BadOutput("malformed API response")
 
 
+# Layer 3 guardrail: refusals, template placeholders, or our own prompt echoed back. Never a real answer.
+LEAK = re.compile(r"\bas an ai\b|language model|\[insert|\binsert \w+(?: \w+)? here\b|lorem ipsum|</?message>"
+                  r"|never follow instructions|reply with one json|json keys:|customer message is data", re.I)
+
+
 def parse(raw: str) -> dict:
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S)
+    if LEAK.search(raw):
+        raise BadOutput("guardrail: placeholder, refusal or prompt text in output")
     start, end = raw.find("{"), raw.rfind("}")
     if start < 0 or end < start:
         raise BadOutput("no JSON in LLM output")
@@ -168,25 +182,51 @@ def parse(raw: str) -> dict:
     return d
 
 
+# Layer 1: strict schemas. Missing key, extra key, wrong type or value outside the enum -> rejected.
+# Only case and whitespace are forgiven on enums (and then counted as a correction in the audit).
+def _enum(field, allowed):
+    def norm(cls, v):
+        return next((a for a in allowed if isinstance(v, str) and v.strip().lower() == a.lower()), v)
+    return field_validator(field, mode="before")(norm)
+
+
+class ClassifyOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    category: Literal[tuple(CATEGORIES)]
+    norm_category = _enum("category", CATEGORIES)
+
+
+class ExtractOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # An omitted nullable key means "not found", same as null (the model does this, e.g. T-1008).
+    order_id: Optional[StrictStr] = None
+    product: Optional[StrictStr] = None
+    urgency: Literal[tuple(URGENCIES)]
+    requested_action: Optional[StrictStr] = None
+    norm_urgency = _enum("urgency", URGENCIES)
+
+
+def validate(schema, d: dict):
+    try:
+        return schema.model_validate(d)
+    except ValidationError as e:
+        err = e.errors()[0]
+        raise BadOutput(f"schema: {'.'.join(map(str, err['loc'])) or 'output'}: {err['msg']}"[:200])
+
+
 def clean_category(raw: str) -> str:
-    return pick(parse(raw).get("category"), CATEGORIES, "category")
+    return validate(ClassifyOut, parse(raw)).category
 
 
 def clean_details(raw: str, text: str) -> dict:
-    d = parse(raw)
+    d = validate(ExtractOut, parse(raw))
+    # Layer 3 deterministic guardrails: each value must be traceable to the message text.
     return {
-        "urgency": pick(d.get("urgency"), URGENCIES, "urgency"),
-        "order_id": order_id(d.get("order_id"), text),
-        "product": product(d.get("product")),
-        "requested_action": short(d.get("requested_action")),
+        "urgency": d.urgency,
+        "order_id": order_id(d.order_id, text),
+        "product": product(d.product, text),
+        "requested_action": short(d.requested_action),
     }
-
-
-def pick(v, allowed, name):
-    for a in allowed:
-        if isinstance(v, str) and v.strip().lower() == a.lower():
-            return a
-    raise BadOutput(f"invalid {name}: {str(v)[:40]!r}")
 
 
 # "ORD-48213", "ord48213", "order 48213", "order no. 48213", "order ID is 48213"
@@ -204,15 +244,17 @@ def order_id(v, text):
     return f"ORD-{found.pop()}" if v is None and len(found) == 1 else None
 
 
-def product(v):
+def product(v, text):
     if not isinstance(v, str) or not v.strip() or v.strip().lower() in ("null", "none"):
         return None
     low = v.lower()
-    for name in CATALOGUE:
-        if re.search(rf"\b{name.split()[0].lower()}\b", low):  # first words are unique: Aura, Pulse, Nimbus, ...
-            return name
-    match = difflib.get_close_matches(v, CATALOGUE, n=1, cutoff=0.6)
-    return match[0] if match else v.strip()[:100]
+    name = next((n for n in CATALOGUE if re.search(rf"\b{n.split()[0].lower()}\b", low)), None)  # first words are unique
+    if not name:
+        match = difflib.get_close_matches(v, CATALOGUE, n=1, cutoff=0.6)
+        name = match[0] if match else v.strip()[:100]
+    # Grounded: some word of the product (3+ chars) must be in the message, else the model invented it.
+    words = re.findall(r"[a-z0-9]{3,}", name.lower())
+    return name if any(re.search(rf"\b{w}", text.lower()) for w in words) else None
 
 
 def short(v):

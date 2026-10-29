@@ -17,6 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 import llm
 
@@ -76,7 +77,12 @@ CREATE TABLE IF NOT EXISTS llm_audit (
     created_at  TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS llm_audit_created ON llm_audit (created_at);
+ALTER TABLE llm_audit ADD COLUMN IF NOT EXISTS checks JSONB NOT NULL DEFAULT '{}';  -- layer -> pass | fail
 """
+# Hand-checked answers for the practice set, scored live against what the pipeline stored.
+GOLDEN_FILE = Path(__file__).with_name("golden.json")
+GOLDEN = {g["message_id"]: g for g in json.loads(GOLDEN_FILE.read_text(encoding="utf-8"))} if GOLDEN_FILE.exists() else {}
+GOLDEN_FIELDS = ("category", "order_id", "product", "urgency")
 
 
 def db():
@@ -266,10 +272,11 @@ def insert_audit(a: dict):
     with db() as conn:
         conn.execute(
             """INSERT INTO llm_audit (id, message_id, stage, model, prompt_hash, raw_output, latency_ms, outcome,
-                                      reason, fields, created_at)
+                                      reason, fields, checks, created_at)
                VALUES (%(id)s, %(message_id)s, %(stage)s, %(model)s, %(prompt_hash)s, %(raw)s, %(latency_ms)s,
-                       %(outcome)s, %(reason)s, %(fields)s, to_timestamp(%(at)s))
-               ON CONFLICT (id) DO NOTHING""", a)  # replay may run twice
+                       %(outcome)s, %(reason)s, %(fields)s, %(checks)s, to_timestamp(%(at)s))
+               ON CONFLICT (id) DO NOTHING""",  # replay may run twice
+            {**a, "checks": Jsonb(a.get("checks") or {})})
 
 
 def ask(fn, mid, text):
@@ -529,12 +536,30 @@ def llm_audit():
                 """SELECT message_id, stage, model, prompt_hash, outcome, reason, latency_ms,
                           left(raw_output, 300) AS raw_output, created_at
                    FROM llm_audit WHERE outcome <> 'passed' ORDER BY created_at DESC LIMIT 50""").fetchall()
+            layers = conn.execute(
+                """SELECT key AS layer, value AS result, count(*) AS n FROM llm_audit, jsonb_each_text(checks)
+                   GROUP BY 1, 2 ORDER BY 1, 2""").fetchall()
+            stored = conn.execute(
+                "SELECT message_id, category, order_id, product, urgency FROM messages WHERE message_id = ANY(%s)",
+                (list(GOLDEN),)).fetchall()
     except psycopg.Error:
         raise HTTPException(503, "storage unavailable")
     return JSONResponse(json.loads(json.dumps(
         {"score": credibility(counts), "by_stage": {s: credibility([c for c in counts if c["stage"] == s])
                                                     for s in {c["stage"] for c in counts}},
+         "layers": layers, "golden": golden_score(stored),
          "counts": counts, "corrected_fields": fields, "recent_issues": recent}, default=str)))
+
+
+def golden_score(stored) -> dict:
+    """Per field: how many processed practice messages match the hand-checked answer."""
+    done = [r for r in stored if r["category"] is not None]
+    out = {"scored": len(done), "of": len(GOLDEN)}
+    for f in GOLDEN_FIELDS:
+        out[f] = sum(r[f] == GOLDEN[r["message_id"]][f] for r in done)
+    out["misses"] = [f"{r['message_id']} {f}: {r[f]!r}, expected {GOLDEN[r['message_id']][f]!r}"
+                     for r in done for f in GOLDEN_FIELDS if r[f] != GOLDEN[r["message_id"]][f]]
+    return out
 
 
 def credibility(counts) -> dict:

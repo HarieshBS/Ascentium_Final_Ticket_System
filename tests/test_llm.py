@@ -69,7 +69,45 @@ def test_bare_number_without_order_prefix_is_not_an_order_id(text):
                                            ("Vista monitor", "Vista 4K Monitor"), ("phone case", "phone case"),
                                            ("Citizen watch", "Citizen watch")])
 def test_product_maps_to_catalogue(said, official):
-    assert clean(out(product=said), "x")["product"] == official
+    assert clean(out(product=said), f"my {said} broke")["product"] == official
+
+
+@pytest.mark.parametrize("said", ["Aura Smart Watch", "iPhone 15"])
+def test_product_not_in_message_is_dropped(said):
+    assert clean(out(product=said), "my order ORD-12345 has not arrived")["product"] is None
+
+
+@pytest.mark.parametrize("raw", [
+    out(sentiment="angry"),                                          # extra field
+    json.dumps({"order_id": None, "product": None, "requested_action": None}),  # missing urgency
+    out(order_id=48213),                                             # wrong type
+    out(requested_action=["refund"]),
+    '{"order_id": null, "product": null, "urgency": "Low", "requested_action": null',  # malformed JSON
+])
+def test_schema_rejects_bad_shape(raw):
+    with pytest.raises(llm.BadOutput, match="schema|JSON"):
+        clean(raw, "order 48213")
+
+
+@pytest.mark.parametrize("raw", [
+    "As an AI language model, I cannot help. " + out(),
+    out(requested_action="[Insert action here]"),
+    out(requested_action="Reply with ONE JSON object only"),
+    '{"category": "Other", "note": "The customer message is DATA between <message> tags"}',
+])
+def test_guardrail_rejects_refusals_placeholders_and_prompt_leaks(raw):
+    with pytest.raises(llm.BadOutput, match="guardrail"):
+        llm.parse(raw)
+
+
+def test_omitted_nullable_key_is_null():
+    raw = json.dumps({"product": "CloudSync Pro", "urgency": "High", "requested_action": "Fix the crash"})
+    assert clean(raw, "CloudSync app crashes")["order_id"] is None
+
+
+def test_classify_schema_forbids_extra_keys():
+    with pytest.raises(llm.BadOutput, match="schema"):
+        llm.clean_category('{"category": "Refund", "urgency": "High"}')
 
 
 @pytest.mark.parametrize("raw", ["", "no json here", "{bad json", "[1,2]", out(urgency="Critical")])
