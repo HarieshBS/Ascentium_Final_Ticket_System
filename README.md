@@ -41,8 +41,9 @@ cp .env.example .env        # then set LLM_BASE_URL and LLM_API_KEY
 docker compose up --build
 ```
 
-- Ops screen: http://localhost:8000
-- Point the message sender at: `http://<this-machine>:8000/messages` (JSON `POST`, see `input_schema.json`)
+- Ops screen: http://localhost:8001 (separate `ops` service; also serves `/api/state`, `/api/results`, `/api/llm-audit`)
+- Point the message sender at: `http://<this-machine>:8000/messages` (the `ingest` service; JSON `POST`, see `input_schema.json`)
+- Services: `ingest` (accepts messages only), `worker` (the single LLM caller), `ops` (screen + API), `db`. Same image, `ROLE` env var. Without Docker, one process runs all three (`ROLE=all`, the default).
 
 ## Run it without Docker
 
@@ -64,7 +65,7 @@ itself if it does not exist, are created automatically.
 ## Get results.json
 
 ```bash
-curl http://localhost:8000/api/results -o results.json
+curl http://localhost:8001/api/results -o results.json   # without Docker: port 8000
 ```
 
 One entry per message: `message_id, status, category, order_id, product, urgency, requested_action`.
@@ -73,7 +74,7 @@ One entry per message: `message_id, status, category, order_id, product, urgency
 
 | What | How |
 |---|---|
-| Live status, totals, health alerts | http://localhost:8000 (refreshes itself every second) |
+| Live status, totals, health alerts | http://localhost:8001 (refreshes itself every second) |
 | Retry one failed message | "Retry" button, or `POST /api/retry/{message_id}` |
 | Retry all failed | "Retry all failed" button, or `POST /api/retry-failed` |
 

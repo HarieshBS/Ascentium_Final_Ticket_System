@@ -1,3 +1,20 @@
+# One image, three roles. Ingest has no dependency on the others, so it keeps taking messages
+# (into Postgres, or its spool file when Postgres is down) while the worker, LLM or ops screen restarts.
+x-app: &app
+  build: .
+  env_file: .env
+  volumes: [spool:/app/spool]
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+
+x-env: &env
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+  SPOOL_DIR: /app/spool
+
 services:
   db:
     image: postgres:16-alpine
@@ -7,16 +24,23 @@ services:
       POSTGRES_DB: postgres
     volumes: [pgdata:/var/lib/postgresql/data]
     restart: unless-stopped
-  app:
-    build: .
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      SPOOL_DIR: /app/spool
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  ingest:
+    <<: *app
+    environment: {<<: *env, ROLE: ingest, SPOOL_FILE: ingest.jsonl}
     ports: ["8000:8000"]
-    volumes: [spool:/app/spool]
-    depends_on: [db]
-    restart: unless-stopped
+  worker:  # the only LLM caller: one process, one call at a time (4 GB VRAM)
+    <<: *app
+    environment: {<<: *env, ROLE: worker, SPOOL_FILE: worker.jsonl}
+  ops:
+    <<: *app
+    environment: {<<: *env, ROLE: ops, SPOOL_FILE: ops.jsonl}
+    ports: ["8001:8000"]
+
 volumes:
   pgdata:
   spool:

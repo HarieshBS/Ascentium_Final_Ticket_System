@@ -59,3 +59,18 @@ def test_spooled_audit_does_not_hold_the_message_back(tmp_path, monkeypatch):
     assert app.spooled_results == set()
     app.replay_spool()
     assert seen == ["a1"]
+
+
+def routes_for(monkeypatch, role):
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(app, "ROLE", role)
+    c = TestClient(app.app)  # no `with`: lifespan threads are not started
+    return {p: c.get(p).status_code for p in ("/healthz", "/", "/api/llm-audit")} | {
+        "POST /messages": c.post("/messages", content=b"not json").status_code}
+
+
+def test_each_service_serves_only_its_routes(monkeypatch):
+    assert routes_for(monkeypatch, "ingest") == {"/healthz": 200, "/": 404, "/api/llm-audit": 404, "POST /messages": 400}
+    assert routes_for(monkeypatch, "worker") == {"/healthz": 200, "/": 404, "/api/llm-audit": 404, "POST /messages": 404}
+    ops = routes_for(monkeypatch, "ops")
+    assert ops["/"] == 200 and ops["POST /messages"] == 404

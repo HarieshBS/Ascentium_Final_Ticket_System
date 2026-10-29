@@ -21,7 +21,10 @@ from psycopg.rows import dict_row
 import llm
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://tickets:tickets@localhost:5432/tickets")
-SPOOL = Path(os.environ.get("SPOOL_DIR", "spool")) / "spool.jsonl"
+# all = everything in one process; ingest / worker / ops = one compose service each, same image.
+ROLE = os.environ.get("ROLE", "all")
+# Each service owns its spool file in the shared dir, so no two processes rewrite the same file.
+SPOOL = Path(os.environ.get("SPOOL_DIR", "spool")) / os.environ.get("SPOOL_FILE", "spool.jsonl")
 BAD_SPOOL = SPOOL.with_suffix(".bad")  # unreadable spool lines (torn by a crash mid-write), kept for ops
 MAX_ATTEMPTS = 3
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
@@ -93,8 +96,9 @@ def ensure_schema():
         conn = db()
     with conn:
         conn.execute(SCHEMA)
-        # ponytail: single instance assumed, so anything 'processing' at startup was orphaned by a crash.
-        conn.execute("UPDATE messages SET status = 'queued', not_before = NULL WHERE status = 'processing'")
+        if ROLE in ("all", "worker"):
+            # ponytail: single worker assumed, so anything 'processing' at its startup was orphaned by a crash.
+            conn.execute("UPDATE messages SET status = 'queued', not_before = NULL WHERE status = 'processing'")
 
 
 # ---------- spool: local, fsynced fallback when storage is down ----------
@@ -162,8 +166,9 @@ def read_lines(path: Path) -> list[str]:
 
 
 def spool_size() -> int:
+    """Records waiting on disk across every service's spool file."""
     with spool_lock:
-        return len(read_lines(SPOOL))
+        return sum(len(read_lines(p)) for p in SPOOL.parent.glob("*.jsonl"))
 
 
 def load_spooled_results():
@@ -182,7 +187,7 @@ ID_IN_LINE = re.compile(r'"message_id": "((?:[^"\\]|\\.)*)"')
 def quarantined() -> list[dict]:
     """Quarantined lines with the message_id salvaged where it survived (it is written before the text)."""
     with spool_lock:
-        lines = read_lines(BAD_SPOOL)
+        lines = [l for p in sorted(SPOOL.parent.glob("*.bad")) for l in read_lines(p)]
     out = []
     for line in lines:
         m = ID_IN_LINE.search(line)
@@ -352,7 +357,8 @@ def try_db(fn, *args):
 def monitor():
     schema_ok = False
     while not stop.is_set():
-        health["llm"] = llm.healthy()
+        if ROLE != "ingest":  # ingest never calls the LLM
+            health["llm"] = llm.healthy()
         try:
             if not schema_ok:
                 ensure_schema()
@@ -371,13 +377,28 @@ def monitor():
 @asynccontextmanager
 async def lifespan(_):
     load_spooled_results()
-    for target in (monitor, worker):
+    for target in (monitor, worker) if ROLE in ("all", "worker") else (monitor,):
         threading.Thread(target=target, daemon=True).start()
     yield
     stop.set()
 
 
 app = FastAPI(title="Kestrel Ticket Desk", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def only_my_routes(request: Request, call_next):
+    """ingest serves only /messages, ops everything else, worker nothing but /healthz."""
+    p = request.url.path
+    if ROLE != "all" and p != "/healthz" and (ROLE == "worker" or (p == "/messages") != (ROLE == "ingest")):
+        return JSONResponse({"detail": f"not served by the {ROLE} service"}, 404)
+    return await call_next(request)
+
+
+@app.get("/healthz")
+def healthz():
+    """Process is up. Ingest stays healthy with storage down: it spools."""
+    return {"role": ROLE, **health}
 
 
 # ---------- HTTP ----------
@@ -428,10 +449,11 @@ def retry_all(request: Request):
 def clear_quarantine(request: Request):
     """Ops has reviewed the quarantined lines. The file is renamed, never deleted."""
     check_token(request)
+    n = 0
     with spool_lock:
-        n = len(read_lines(BAD_SPOOL))
-        if n:
-            BAD_SPOOL.rename(BAD_SPOOL.with_name(f"{BAD_SPOOL.name}.{int(time.time())}.reviewed"))
+        for p in SPOOL.parent.glob("*.bad"):
+            n += len(read_lines(p))
+            p.rename(p.with_name(f"{p.name}.{int(time.time())}.reviewed"))
     return {"cleared": n}
 
 

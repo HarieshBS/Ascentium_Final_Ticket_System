@@ -114,3 +114,22 @@ answer. If storage is down the audit row goes to the spool like everything else 
 idempotent on a random id) and it does not hold the message back from the queue. `GET /api/llm-audit` returns
 the score, a per-stage breakdown, the fields corrected most often and the last 50 non-passed calls. The ops
 screen shows the same. Lives in `app.py`/`llm.py`, not a new service: it is one table and one query.
+
+## Afternoon change 3: one compose service per concern
+`ingest` (only `POST /messages`, port 8000), `worker` (the only LLM caller, no port), `ops` (screen and API,
+port 8001) and `db`. All three app services are the same image with a `ROLE` env var, and a middleware returns
+404 for routes that do not belong to the role. Without Docker, `ROLE=all` (the default) is the old single process.
+- **Ingest never waits on anything.** It has no `depends_on` and never calls the LLM. If Postgres is down it
+  spools to disk and replays on its own when Postgres is back. Stopping the worker or ops does not touch it.
+- **Spool volume, one file per service** (`ingest.jsonl`, `worker.jsonl`). Two processes rewriting one file
+  would need cross-process locking. With one owner per file, the in-process lock is still enough. The ops screen
+  counts and quarantines across every `*.jsonl` / `*.bad` file in the shared volume.
+- **Only the worker requeues orphaned `processing` rows at startup.** Before the split this ran in the one
+  process. Now an ops or ingest restart must not steal the worker's in-flight message. The rule "1 worker" is
+  still the reason this is safe.
+- Healthchecks: `pg_isready` for db. A `/healthz` GET for each app service (stdlib `urllib`, since the slim image
+  has no curl). `restart: unless-stopped` everywhere. Ingest reports healthy while storage is down because it
+  still accepts messages. Trade-off: plain compose marks a hung container unhealthy but does not restart it.
+  Only a crash triggers the restart policy. A watchdog was not worth adding.
+- Proof: 40 messages sent every 0.5 s while `docker compose stop worker` / `start worker` and `stop ops` /
+  `start ops` ran mid-stream: 40/40 got `202`, all 40 completed, 0 duplicates and 0 repeat LLM calls.
