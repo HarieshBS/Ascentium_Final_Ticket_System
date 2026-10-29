@@ -104,6 +104,7 @@ def test_category_survives_storage_outage_between_the_two_calls(tmp_path, monkey
     monkeypatch.setattr(app, "save_classification", down)
     monkeypatch.setattr(app, "record_failure", down)
     monkeypatch.setattr(app, "insert_audit", lambda a: None)
+    monkeypatch.setattr(app, "take_worker_lock", lambda: type("Lock", (), {"execute": lambda self, q: None})())
     app.worker()
 
     assert app.spooled_results == {"m1"}  # held back from the queue while only the spool has the category
@@ -118,3 +119,14 @@ def test_category_survives_storage_outage_between_the_two_calls(tmp_path, monkey
     app.worker()
     assert llm_calls == ["classify", "extract", "extract"]  # no second classify call
     assert db["completed"]["category"] == "Refund"
+
+
+def test_second_worker_waits_without_claiming(monkeypatch):
+    monkeypatch.setattr(app, "stop", app.threading.Event())
+    monkeypatch.setattr(app, "health", {"llm": True, "storage": True})
+    tries = []
+    monkeypatch.setattr(app, "take_worker_lock", lambda: tries.append(1))  # None: another worker holds it
+    monkeypatch.setattr(app.time, "sleep", lambda s: len(tries) >= 3 and app.stop.set())
+    monkeypatch.setattr(app, "claim", lambda: pytest.fail("claimed without the worker lock"))
+    app.worker()
+    assert len(tries) == 3

@@ -102,9 +102,20 @@ def ensure_schema():
         conn = db()
     with conn:
         conn.execute(SCHEMA)
-        if ROLE in ("all", "worker"):
-            # ponytail: single worker assumed, so anything 'processing' at its startup was orphaned by a crash.
-            conn.execute("UPDATE messages SET status = 'queued', not_before = NULL WHERE status = 'processing'")
+
+
+WORKER_LOCK = 4242  # Postgres advisory lock key: at most one worker processes at a time (4 GB VRAM)
+
+
+def take_worker_lock():
+    """Session lock on its own connection, held for the worker's lifetime. None if another worker holds it."""
+    conn = db()
+    if not conn.execute("SELECT pg_try_advisory_lock(%s) AS ok", (WORKER_LOCK,)).fetchone()["ok"]:
+        conn.close()
+        return None
+    # We are the only worker, so anything still 'processing' was orphaned by a dead one.
+    conn.execute("UPDATE messages SET status = 'queued', not_before = NULL WHERE status = 'processing'")
+    return conn
 
 
 # ---------- spool: local, fsynced fallback when storage is down ----------
@@ -304,10 +315,28 @@ def release(message_id):
 
 def worker():
     # One worker, one LLM call at a time: the local model has ~4 GB of VRAM and cannot serve parallel requests.
+    lock, waiting = None, False
     while not stop.is_set():
         if not (health["llm"] and health["storage"]):
             time.sleep(1)
             continue
+        try:
+            if lock is not None:
+                lock.execute("SELECT 1")  # a DB restart drops the session lock with the connection
+        except psycopg.Error:
+            lock = None
+        if lock is None:
+            try:
+                lock = take_worker_lock()
+            except psycopg.Error:
+                pass
+            if lock is None:
+                if not waiting:
+                    log.info("waiting for worker lock: another worker is running")
+                waiting = True
+                time.sleep(2)
+                continue
+            waiting = False
         try:
             row = claim()
         except psycopg.Error as e:

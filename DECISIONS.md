@@ -172,3 +172,6 @@ Storage keeps its red banner because then messages are only on local disk.
 Follow-up: `unavailable` rows now store the cause (`endpoint unreachable: HTTP 502`, `ConnectError`, ...). They are
 shown as a count ("Endpoint unreachable, not scored") rather than in the list of corrected/rejected answers,
 because an outage says nothing about the model's answers.
+
+## Afternoon change 6: one worker, enforced
+The worker holds a Postgres session advisory lock (`pg_try_advisory_lock(4242)`) on its own connection. A second worker (`--scale worker=2`) logs "waiting for worker lock" and never claims. If the DB restarts, the lock is re-taken before the next claim. The orphaned-`processing` reset now runs only after the lock is taken, so a waiting worker cannot steal the running worker's message.
