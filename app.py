@@ -20,7 +20,6 @@ import llm
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://tickets:tickets@localhost:5432/tickets")
 SPOOL = Path(os.environ.get("SPOOL_DIR", "spool")) / "spool.jsonl"
-WORKERS = int(os.environ.get("WORKERS", "3"))
 MAX_ATTEMPTS = 3
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "300"))
 OPS_TOKEN = os.environ.get("OPS_TOKEN", "")
@@ -107,7 +106,7 @@ def replay_spool():
                 if rec["kind"] == "msg":
                     store_message(rec["message_id"], rec["text"])
                 else:
-                    save_result(rec["message_id"], rec["fields"], rec["calls"], rec["repeat"])
+                    save_result(rec["message_id"], rec["fields"], rec["calls"])
                     spooled_results.discard(rec["message_id"])
                 done += 1
         finally:
@@ -160,30 +159,39 @@ def claim():
                    WHERE ((status = 'queued' AND (not_before IS NULL OR not_before <= now()))
                        OR (status = 'processing' AND not_before < now()))   -- lease expired: worker died
                      AND NOT (message_id = ANY(%s))
-                   ORDER BY received_at LIMIT 1 FOR UPDATE SKIP LOCKED)
-               RETURNING message_id, text, attempts, llm_calls, llm_repeats, category""",
+                   ORDER BY attempts, received_at   -- retries go behind fresh messages
+                   LIMIT 1 FOR UPDATE SKIP LOCKED)
+               RETURNING message_id, text, attempts, category""",
             (LEASE_SECONDS, list(spooled_results))).fetchone()
 
 
-def save_result(message_id, fields, calls, repeat):
+def save_classification(message_id, category, calls):
+    with db() as conn:
+        conn.execute(
+            """UPDATE messages SET llm_repeats = llm_repeats + (category IS NOT NULL)::int, category = %s,
+                   llm_calls = llm_calls + %s, updated_at = now() WHERE message_id = %s""",
+            (category, calls, message_id))
+
+
+def save_result(message_id, fields, calls):
     with db() as conn:
         conn.execute(
             """UPDATE messages SET status = 'completed', category = %(category)s, order_id = %(order_id)s,
                    product = %(product)s, urgency = %(urgency)s, requested_action = %(requested_action)s,
                    llm_raw = %(raw)s, attempts = attempts + 1, failure_reason = NULL,
-                   llm_calls = llm_calls + %(calls)s, llm_repeats = llm_repeats + %(repeat)s, updated_at = now()
+                   llm_calls = llm_calls + %(calls)s, updated_at = now()
                WHERE message_id = %(id)s AND status <> 'completed'""",
-            {**fields, "id": message_id, "calls": calls, "repeat": repeat})
+            {**fields, "id": message_id, "calls": calls})
 
 
-def record_failure(message_id, reason, attempts):
+def record_failure(message_id, reason, attempts, calls):
     final = attempts >= MAX_ATTEMPTS
     with db() as conn:
         conn.execute(
-            """UPDATE messages SET status = %s, attempts = %s, failure_reason = %s, llm_calls = llm_calls + 1,
+            """UPDATE messages SET status = %s, attempts = %s, failure_reason = %s, llm_calls = llm_calls + %s,
                    not_before = now() + %s * interval '1 second', updated_at = now()
                WHERE message_id = %s""",
-            ("failed" if final else "queued", attempts, reason, 2 ** attempts, message_id))
+            ("failed" if final else "queued", attempts, reason, calls, 2 ** attempts, message_id))
 
 
 def release(message_id):
@@ -195,38 +203,51 @@ def release(message_id):
 # ---------- background threads ----------
 
 def worker():
+    # One worker, one LLM call at a time: the local model has ~4 GB of VRAM and cannot serve parallel requests.
     while not stop.is_set():
         if not (health["llm"] and health["storage"]):
             time.sleep(1)
             continue
         try:
             row = claim()
-        except psycopg.Error:
+        except psycopg.Error as e:
+            log.error("claim failed: %s", e)
             health["storage"] = False
+            time.sleep(1)
             continue
         if not row:
             time.sleep(0.5)
             continue
-        mid = row["message_id"]
-        repeat = 1 if row["category"] else 0  # it already had a successful result once
+        mid, text, category = row["message_id"], row["text"], row["category"]
+        calls, stage = 0, "classify"  # calls = LLM calls made but not yet written to storage
         try:
-            result, raw = llm.call(row["text"])
+            if category is None:  # a saved classification is never redone, even after a failed extraction
+                category, _ = llm.classify(text)
+                calls += 1
+                try:
+                    save_classification(mid, category, calls)
+                    calls = 0
+                except psycopg.Error:
+                    health["storage"] = False  # carried in the final result / spool instead
+            stage = "extract"
+            details, raw = llm.extract(text)
+            calls += 1
         except llm.LLMUnavailable as e:
             log.warning("LLM unavailable (%s); pausing, %s goes back to queue without using an attempt", e, mid)
             health["llm"] = False
             try_db(release, mid)
             continue
         except llm.BadOutput as e:
-            log.warning("%s attempt %d failed: %s", mid, row["attempts"] + 1, e)
-            try_db(record_failure, mid, str(e), row["attempts"] + 1)
+            log.warning("%s attempt %d failed at %s: %s", mid, row["attempts"] + 1, stage, e)
+            try_db(record_failure, mid, f"{stage}: {e}", row["attempts"] + 1, calls + 1)
             continue
-        fields = {**result, "raw": raw[:4000]}
+        fields = {**details, "category": category, "raw": raw[:4000]}
         try:
-            save_result(mid, fields, 1, repeat)
-            log.info("%s completed: %s", mid, result["category"])
+            save_result(mid, fields, calls)
+            log.info("%s completed: %s", mid, category)
         except psycopg.Error:
             health["storage"] = False
-            spool({"kind": "result", "message_id": mid, "fields": fields, "calls": 1, "repeat": repeat})
+            spool({"kind": "result", "message_id": mid, "fields": fields, "calls": calls})
             log.warning("storage down; result for %s spooled to disk", mid)
 
 
@@ -259,10 +280,8 @@ def monitor():
 @asynccontextmanager
 async def lifespan(_):
     load_spooled_results()
-    threads = [threading.Thread(target=monitor, daemon=True)] + \
-              [threading.Thread(target=worker, daemon=True) for _ in range(WORKERS)]
-    for t in threads:
-        t.start()
+    for target in (monitor, worker):
+        threading.Thread(target=target, daemon=True).start()
     yield
     stop.set()
 

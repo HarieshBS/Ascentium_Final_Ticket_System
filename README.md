@@ -14,18 +14,22 @@ flowchart LR
     API -- "INSERT ON CONFLICT DO NOTHING" --> DB[(PostgreSQL<br/>messages table = queue)]
     API -. "storage down" .-> SP[[Local spool file<br/>fsync'd JSONL]]
     SP -. "auto replay when storage is back" .-> DB
-    DB -- "claim: FOR UPDATE SKIP LOCKED" --> W[Worker threads x N]
-    W -- "temperature 0, few-shot, JSON" --> LLM[Local LLM<br/>OpenAI-compatible API]
-    W -- "validate + normalise in code<br/>save result once" --> DB
+    DB -- "claim: FOR UPDATE SKIP LOCKED" --> W[Single worker<br/>one LLM call at a time]
+    W -- "call 1: classify (category)" --> LLM[Local LLM<br/>OpenAI-compatible API]
+    W -- "call 2: extract (order, product,<br/>urgency, action)" --> LLM
+    W -- "save category after call 1,<br/>details after call 2" --> DB
     W -. "storage down after LLM success" .-> SP
     M[Health monitor] -. "ping every 3s" .-> LLM
     M -. "SELECT 1" .-> DB
     UI[Ops screen<br/>polls /api/state every 1s] --> API
 ```
 
+Each message gets two independent LLM calls: classification, then extraction. The category is saved
+as soon as call 1 succeeds, so a failed extraction never re-runs classification.
+
 Message lifecycle: `queued → processing → completed`, or `→ queued` again on a bad LLM answer
 (back-off 2s, 4s), `→ failed` after 3 attempts. Empty or invalid text goes straight to `rejected`.
-If the LLM is unreachable, workers pause and no attempts are used. Design choices and trade-offs are in
+If the LLM is unreachable, the worker pauses and no attempts are used. Design choices and trade-offs are in
 [DECISIONS.md](DECISIONS.md).
 
 ## Run it (Docker, recommended)
@@ -84,7 +88,6 @@ If `OPS_TOKEN` is set, retry calls need header `X-Ops-Token` (the screen asks fo
 | `LLM_API_KEY` | empty | Sent as `Bearer` token; never logged |
 | `LLM_TIMEOUT` | `120` | Seconds per LLM call |
 | `DATABASE_URL` | `postgresql://tickets:tickets@localhost:5432/tickets` | Storage |
-| `WORKERS` | `3` | Parallel LLM calls |
 | `SPOOL_DIR` | `spool` | Where messages wait while storage is down |
 | `OPS_TOKEN` | empty | Protects retry endpoints |
 
