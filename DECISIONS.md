@@ -204,3 +204,10 @@ Each line points to the section with the reasoning.
 | Latest-500 / all-messages toggle on the ops screen ("Final changes before freeze") | Candidate |
 | 3 attempts with back-off, then `failed` with the reason; ops can retry one or all ("Status meanings", README Operations) | Brief |
 | results.json generated from the API on a fresh database, validated by `check_results.py`, committed ("Final changes before freeze") | Candidate |
+
+## Reproducibility
+- Every LLM call uses `temperature=0`.
+- Prompts are fixed, with few-shot examples. The prompt hash and model name are recorded for each call in the LLM audit.
+- Code enforces the enums, rebuilds order ids from the message text and runs a grounding check, so the model cannot add new values.
+- `golden.json` and `check_results.py` score every run. The last three fresh-database runs had zero diffs: 23/23 on category, product and order_id, and 22/23 on urgency.
+- Caveat: the remote model endpoint is not ours. Any drift would show up in the prompt hash, the model name and the golden score.
