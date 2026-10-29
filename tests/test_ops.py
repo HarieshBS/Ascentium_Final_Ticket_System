@@ -92,7 +92,7 @@ def routes_for(monkeypatch, role):
 
 
 def test_each_service_serves_only_its_routes(monkeypatch):
-    assert routes_for(monkeypatch, "ingest") == {"/healthz": 200, "/": 404, "/api/llm-audit": 404, "POST /messages": 400}
+    assert routes_for(monkeypatch, "ingest") == {"/healthz": 200, "/": 200, "/api/llm-audit": 404, "POST /messages": 400}
     assert routes_for(monkeypatch, "worker") == {"/healthz": 200, "/": 404, "/api/llm-audit": 404, "POST /messages": 404}
     ops = routes_for(monkeypatch, "ops")
     assert ops["/"] == 200 and ops["POST /messages"] == 404

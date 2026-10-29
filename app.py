@@ -397,6 +397,8 @@ app = FastAPI(title="Kestrel Ticket Desk", lifespan=lifespan)
 async def only_my_routes(request: Request, call_next):
     """ingest serves only /messages, ops everything else, worker nothing but /healthz."""
     p = request.url.path
+    if ROLE == "ingest" and p == "/":  # someone opened the ingest port in a browser
+        return JSONResponse({"service": "ingest", "send": "POST /messages", "ops_screen": "port 8001"})
     if ROLE != "all" and p != "/healthz" and (ROLE == "worker" or (p == "/messages") != (ROLE == "ingest")):
         return JSONResponse({"detail": f"not served by the {ROLE} service"}, 404)
     return await call_next(request)
