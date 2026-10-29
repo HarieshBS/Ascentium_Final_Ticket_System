@@ -63,7 +63,8 @@ def test_storage_failure_still_keeps_the_rest_in_the_spool(stored, monkeypatch):
     assert app.BAD_SPOOL.read_text() == "{torn\n"
 
 
-def test_clear_renames_instead_of_deleting(stored):
+def test_clear_renames_instead_of_deleting(stored, monkeypatch):
+    monkeypatch.setattr(app, "OPS_TOKEN", "")
     app.BAD_SPOOL.write_text("{torn\n", encoding="utf-8")
     assert app.clear_quarantine(type("R", (), {"headers": {}})())["cleared"] == 1
     assert not app.BAD_SPOOL.exists()
