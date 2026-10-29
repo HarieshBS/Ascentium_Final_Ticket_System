@@ -10,6 +10,11 @@ def test_no_llm_down_alert_on_ops_screen():
     assert "LLM service is DOWN" not in INDEX
 
 
+def test_quiet_llm_indicator_still_changes_when_down():
+    assert '"LLM: up" : "LLM: down, processing paused"' in INDEX
+    assert not any("alerts.push" in l and "llm" in l.lower() for l in INDEX.splitlines())
+
+
 def audit_of(monkeypatch, reply, text, stage="extract"):
     monkeypatch.setattr(llm, "_chat", lambda msgs: reply)
     fn = llm.extract if stage == "extract" else llm.classify

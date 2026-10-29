@@ -17,7 +17,9 @@
   .tile:hover { transform:translateY(-2px); box-shadow:0 10px 28px rgba(30, 55, 90, .12); }
   .tile b { display:block; margin-bottom:2px; font-size:24px; letter-spacing:-.03em; }
   .tile span { color:var(--muted); font-size:12px; font-weight:600; }
-  .up { color:var(--ok); } .down { color:var(--bad); }
+  .up { color:var(--ok); } .down { color:var(--bad); } .warn { color:var(--warn); }
+  .pill { align-self:center; padding:4px 12px; border:1px solid var(--line); border-radius:999px; background:var(--card); font-size:13px; font-weight:600; }
+  .pill::before { content:"●"; margin-right:6px; }
   table { width:100%; border-collapse:collapse; background:var(--card); }
   th, td { text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { position:sticky; top:0; background:var(--card); color:var(--muted); font-size:11px; letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
@@ -102,7 +104,8 @@ async function refresh() {
   }));
 
   document.getElementById("health").replaceChildren(
-    tile("LLM service", s.health.llm ? "UP" : "DOWN", s.health.llm ? "up" : "down"),
+    // Quiet indicator, no banner: an LLM outage loses nothing (the worker pauses, messages wait in the queue).
+    el("div", s.health.llm ? "LLM: up" : "LLM: down, processing paused", "pill " + (s.health.llm ? "up" : "warn")),
     tile("Storage", s.health.storage ? "UP" : "DOWN", s.health.storage ? "up" : "down"),
     tile("Waiting on disk", s.spooled));
 

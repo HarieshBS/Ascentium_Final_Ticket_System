@@ -163,3 +163,9 @@ No moderation call either: output only reaches internal ops staff (single-tenant
 Found on the first real-LLM run: with every key required, T-1008 failed all 3 attempts because the model left
 out `order_id` (the rest of the answer was right). An omitted *nullable* key now means null. `urgency` is still
 required, and extra keys and wrong types are still rejected.
+
+## Afternoon change 5: quiet LLM status instead of an alert
+The LLM state is back on the ops screen, but as a small pill in the health row ("LLM: up" in green, or "LLM: down,
+processing paused" in amber), not a red banner. That still gives a clear signal when the LLM is down, as page 5
+asks. It is not an alarm because an LLM outage loses nothing: the worker pauses and messages wait in the queue.
+Storage keeps its red banner because then messages are only on local disk.

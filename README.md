@@ -38,7 +38,26 @@ Prerequisites: Docker with Compose.
 
 ```bash
 cp .env.example .env        # then set LLM_BASE_URL and LLM_API_KEY
-docker compose up --build
+docker compose up -d --build
+```
+
+Windows PowerShell (one command per line):
+
+```powershell
+Copy-Item .env.example .env          # first time only, then edit LLM_BASE_URL
+docker compose up -d --build         # builds and starts db, ingest, worker, ops
+docker compose ps                    # all four should say (healthy) after ~20 s
+docker compose logs -f worker        # watch LLM processing; Ctrl+C to stop watching
+docker compose down                  # stop everything (data stays in the volumes)
+```
+
+Demo that ingest keeps accepting while other parts are down:
+
+```powershell
+docker compose stop worker           # messages still get 202 and wait in the queue
+docker compose start worker          # the backlog drains
+docker compose stop db               # messages still get 202, spooled to disk ("Waiting on disk")
+docker compose start db              # the spool replays into Postgres within a few seconds
 ```
 
 - Ops screen: http://localhost:8001 (separate `ops` service; also serves `/api/state`, `/api/results`, `/api/llm-audit`)
