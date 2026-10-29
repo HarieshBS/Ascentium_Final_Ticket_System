@@ -211,3 +211,24 @@ Each line points to the section with the reasoning.
 - Code enforces the enums, rebuilds order ids from the message text and runs a grounding check, so the model cannot add new values.
 - `golden.json` and `check_results.py` score every run. The last three fresh-database runs had zero diffs: 23/23 on category, product and order_id, and 22/23 on urgency.
 - Caveat: the remote model endpoint is not ours. Any drift would show up in the prompt hash, the model name and the golden score.
+
+## Branch feature/ingest-ha: two ingest replicas behind a proxy (post-freeze)
+Ingest was the last single point of failure for accepting messages. Now:
+- `ingest-a` and `ingest-b` (same image, `ROLE=ingest`) sit behind `nginx:1.28-alpine`, which keeps the service
+  name `ingest` and port 8000, so the sender changes nothing. nginx retries a failed POST on the other replica
+  (`proxy_next_upstream ... non_idempotent`). That is safe because `message_id` is the primary key: a double
+  delivery becomes a counted duplicate, never a second ticket.
+- **Spool:** each replica writes its own file (`ingest-a.jsonl`, `ingest-b.jsonl`) in the shared spool volume.
+  Shared, not one volume each, because the worker and ops must see every file. The worker drains every
+  `ingest*.jsonl` too, so messages spooled by a replica that stays down still reach Postgres. Spool and replay
+  now hold an `flock` on `<file>.lock`, so the owning replica and the worker never interleave on one file.
+- **DNS:** a restarted replica comes back with a new IP. `resolve` + `resolver valid=1s` makes nginx follow it.
+  The first test run used `valid=5s` and gave 2 of 40 `504`s: ingest-b was killed while nginx still held
+  ingest-a's old IP. Those 2 were never acknowledged, so the sender resends them. With 1s: 0 failures.
+- **Proof** (separate compose project `ticket-ha` on ports 9000/9001, its own Postgres): 40 messages at
+  2.5/s while ingest-a was killed and restarted, then ingest-b, twice with different timings: 80/80 got `202`,
+  80 stored, 0 duplicates. Drain: with Postgres down, 10 messages were spooled 5/5 across the replicas and
+  ingest-a was stopped for good. When Postgres returned, the worker replayed both files and all 10 were stored.
+- **Trade-offs:** nginx is now the single entry point, but it is a static config with `restart: unless-stopped`
+  and much less likely to fail than the app. A second proxy would need a host-level VIP, which is out of scope.
+  `fcntl` makes the app Linux-only, which it already is in practice (containers, WSL).

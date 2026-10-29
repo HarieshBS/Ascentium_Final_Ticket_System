@@ -1,4 +1,5 @@
 """Ticket service: HTTP ingest, worker threads, ops API. Postgres is the queue and the source of truth."""
+import fcntl
 import hmac
 import json
 import logging
@@ -7,7 +8,7 @@ import re
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 import psycopg
@@ -123,9 +124,19 @@ def take_worker_lock():
 HOLDS_BACK = ("class", "result")  # spooled LLM results: the message must not be re-processed until replayed
 
 
-def spool(record: dict):
+@contextmanager
+def locked(path: Path):
+    """Thread lock plus an flock on a side file, so two ingest replicas, or the worker draining a dead
+    replica's spool, never interleave on one spool file. ponytail: fcntl is Linux only (the containers, WSL)."""
     with spool_lock:
-        SPOOL.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.with_suffix(".lock").open("a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            yield
+
+
+def spool(record: dict):
+    with locked(SPOOL):
         with SPOOL.open("a+b") as f:
             if f.seek(0, 2):  # never glue a new record onto a torn last line left by a crash
                 f.seek(-1, 2)
@@ -138,12 +149,14 @@ def spool(record: dict):
             spooled_results.add(record["message_id"])
 
 
-def replay_spool():
+def replay_spool(path: Path | None = None):
     """Push spooled messages/results into storage. Safe to run twice: every write is idempotent."""
-    with spool_lock:
-        if not SPOOL.exists():
+    path = path or SPOOL
+    bad_spool = path.with_suffix(".bad")
+    with locked(path):
+        if not path.exists():
             return
-        lines = read_lines(SPOOL)
+        lines = read_lines(path)
         done, bad = 0, []
         try:
             for line in lines:
@@ -162,15 +175,15 @@ def replay_spool():
         finally:
             if bad:
                 # Written before the spool shrinks. ponytail: a crash in between quarantines the line twice; harmless.
-                with BAD_SPOOL.open("a", encoding="utf-8") as f:
+                with bad_spool.open("a", encoding="utf-8") as f:
                     f.write("".join(l + "\n" for l in bad))
                     f.flush()
                     os.fsync(f.fileno())
-                log.error("quarantined %d unreadable spool line(s) to %s", len(bad), BAD_SPOOL)
+                log.error("quarantined %d unreadable spool line(s) to %s", len(bad), bad_spool)
             rest = lines[done:]
-            tmp = SPOOL.with_suffix(".tmp")
+            tmp = path.with_suffix(".tmp")
             tmp.write_text("".join(l + "\n" for l in rest), encoding="utf-8")
-            os.replace(tmp, SPOOL)
+            os.replace(tmp, path)
             spooled_results.clear()
             load_spooled_results()  # ids still waiting on disk stay held back from the queue
     if done:
@@ -392,6 +405,13 @@ def try_db(fn, *args):
         health["storage"] = False  # the lease will expire and the message is retried
 
 
+def drain_ingest_spools():
+    """A replica that died with messages on disk may stay down: the worker replays its file too.
+    Only `msg` records live there, so nothing is held back from the queue; the flock keeps it safe if it is alive."""
+    for p in sorted(SPOOL.parent.glob("ingest*.jsonl")):
+        replay_spool(p)
+
+
 def monitor():
     schema_ok = False
     while not stop.is_set():
@@ -405,6 +425,8 @@ def monitor():
                 conn.execute("SELECT 1")
             health["storage"] = True
             replay_spool()
+            if ROLE == "worker":
+                drain_ingest_spools()
         except (psycopg.Error, OSError) as e:
             if health["storage"]:
                 log.error("storage unavailable: %s", type(e).__name__)

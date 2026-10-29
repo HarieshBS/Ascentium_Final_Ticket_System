@@ -130,3 +130,20 @@ def test_second_worker_waits_without_claiming(monkeypatch):
     monkeypatch.setattr(app, "claim", lambda: pytest.fail("claimed without the worker lock"))
     app.worker()
     assert len(tries) == 3
+
+
+def test_worker_drains_a_dead_ingest_replicas_spool(stored, monkeypatch):
+    app.SPOOL.parent.joinpath("ingest-b.jsonl").write_text(line("b1") + line("b2"), encoding="utf-8")
+    app.drain_ingest_spools()
+    assert stored == ["b1", "b2"]
+    assert app.SPOOL.parent.joinpath("ingest-b.jsonl").read_text() == ""
+
+
+def test_spool_and_replay_take_a_file_lock(stored):
+    import fcntl
+    app.spool({"kind": "msg", "message_id": "m1", "text": "hi"})
+    lock = app.SPOOL.with_suffix(".lock")
+    assert lock.exists()
+    with lock.open("a") as f:  # released once spool() returns, so another process can take it at once
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)
